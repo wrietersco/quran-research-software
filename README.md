@@ -2,10 +2,12 @@
 
 SQLite-first pipeline for Lane-style lexicon JSON, optional live scraping from [lexicon.quranic-research.net](https://lexicon.quranic-research.net), Quran word lists, and heuristic token→root mapping.
 
+**Repository:** [github.com/wrietersco/quran-research-software](https://github.com/wrietersco/quran-research-software) — the working SQLite file `data/db/quran_lexicon.db` is not tracked; run **`python database.py`** (or the step-by-step scripts below) after cloning.
+
 ## Quick start
 
 ```powershell
-cd D:\hassan_backup\quran\selenium
+cd path\to\quran-research-software
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
