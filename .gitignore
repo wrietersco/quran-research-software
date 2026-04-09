@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+.env
+# Step 6 session exports (knowledge chunks + reports)
+data/sessions/
+.venv/
+venv/
+*.egg-info/
+.idea/
+# Downloaded on first run (OFL); see src/ui/app_fonts.py
+assets/fonts/*.ttf

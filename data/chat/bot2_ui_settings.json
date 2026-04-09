@@ -1,0 +1,6 @@
+{
+  "model": "gpt-4o-mini",
+  "vector_store_ids": [],
+  "max_synonyms": 5,
+  "temperature": null
+}

@@ -1,0 +1,32 @@
+# Scraper runtime
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# Desktop UI (server.py): icons + ImageTk
+Pillow>=10.0.0
+
+# Desktop verse hierarchy chart (server.py)
+matplotlib>=3.8.0
+networkx>=3.2.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+pyarabic>=0.6.15
+
+# Question refiner chat (OPENAI_API_KEY from .env or environment)
+openai>=2.0.0
+python-dotenv>=1.0.0
+
+# Step 6 report exports
+markdown>=3.7
+python-docx>=1.1.0
+xhtml2pdf>=0.2.15
+
+# HTTP API server (api_server.py)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# Step 5 optional: CrossEncoder verse prefilter (pulls PyTorch; first run may download ~500MB+ model)
+sentence-transformers>=3.0.0
+
+# Optional dev
+# pytest>=8.0.0

@@ -1,0 +1,7 @@
+# Optional: Stanza validator for morphology_pipeline (Service D).
+# After install, download Arabic models once:
+#
+#   pip install -r requirements-stanza.txt
+#   python -c "import stanza; stanza.download('ar')"
+#
+stanza>=1.7.0

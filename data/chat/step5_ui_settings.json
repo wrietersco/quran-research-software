@@ -1,0 +1,13 @@
+{
+  "provider": "openrouter",
+  "model": "deepseek/deepseek-v3.2",
+  "all_verses": true,
+  "verse_n": 50,
+  "max_workers": 2,
+  "relevance_threshold_pct": 30,
+  "use_shortlist_for_synthesis": true,
+  "synthesis_mode": "loaded",
+  "shortlist_method": "llm",
+  "shortlist_llm_provider": "openrouter",
+  "shortlist_llm_model": "deepseek/deepseek-v3.2"
+}

@@ -1,0 +1,7 @@
+1:1:1:1	بِ	P	P|PREF|LEM:ب
+1:1:1:2	سْمِ	N	ROOT:سمو|LEM:اسْم|M|GEN
+1:1:2:1	ٱللَّهِ	N	PN|ROOT:أله|LEM:اللَّه|GEN
+1:1:3:1	ٱل	P	DET|PREF|LEM:ال
+1:1:3:2	رَّحْمَٰنِ	N	ROOT:رحم|LEM:رَحْمٰن|MS|GEN|ADJ
+1:1:4:1	ٱل	P	DET|PREF|LEM:ال
+1:1:4:2	رَّحِيمِ	N	ROOT:رحم|LEM:رَحِيم|MS|GEN|ADJ
