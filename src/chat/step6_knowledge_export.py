@@ -24,8 +24,11 @@ from src.db.chat_pipeline import (
 from src.db.step6_report import (
     delete_step6_knowledge_files_for_session,
     insert_step6_knowledge_file,
+    list_openai_report_file_ids_for_session,
     list_step6_knowledge_files,
     max_step6_knowledge_chunk_index,
+    null_all_step6_report_openai_file_ids,
+    update_step6_report_run,
 )
 from src.openai_platform.resources import OpenAIAdminError, attach_file_to_vector_store, upload_file_to_openai
 
@@ -260,6 +263,34 @@ def knowledge_markdown_for_appendix(conn: sqlite3.Connection, chat_session_id: s
     return "".join(iter_knowledge_document_pieces(conn, chat_session_id))
 
 
+def index_report_markdown_on_session_vector_store(
+    conn: sqlite3.Connection,
+    chat_session_id: str,
+    session_title: str | None,
+    report_md_path: Path,
+    run_id: int,
+    *,
+    commit: bool = True,
+) -> str:
+    """
+    Upload ``report.md`` to OpenAI, attach to the session vector store, and persist
+    ``openai_report_file_id`` on ``step6_report_runs`` for ``run_id``.
+    """
+    vid = ensure_session_vector_store_in_db(conn, chat_session_id, session_title)
+    if not vid:
+        raise OpenAIAdminError("Could not resolve vector store for session.")
+    up = upload_file_to_openai(report_md_path, purpose="assistants")
+    fid = str(up["id"])
+    attach_file_to_vector_store(vid, fid)
+    update_step6_report_run(
+        conn,
+        run_id,
+        openai_report_file_id=fid,
+        commit=commit,
+    )
+    return fid
+
+
 def clear_session_step6_knowledge(
     conn: sqlite3.Connection,
     chat_session_id: str,
@@ -273,13 +304,18 @@ def clear_session_step6_knowledge(
     """
     vid = get_chat_session_openai_vector_store_id(conn, chat_session_id)
     rows = list_step6_knowledge_files(conn, chat_session_id)
+    report_fids = list_openai_report_file_ids_for_session(conn, chat_session_id)
     n = len(rows)
-    if vid and rows:
+    fids = list(
+        dict.fromkeys([r.openai_file_id for r in rows] + report_fids)
+    )
+    if vid and fids:
         detach_and_delete_openai_knowledge_files(
             vid,
-            [r.openai_file_id for r in rows],
+            fids,
             delete_remote_file_objects=delete_openai_file_objects,
         )
+    null_all_step6_report_openai_file_ids(conn, chat_session_id, commit=False)
     delete_step6_knowledge_files_for_session(conn, chat_session_id, commit=False)
     conn.commit()
     if delete_local_files:
@@ -320,12 +356,16 @@ def replace_knowledge_on_vector_store(
 
     if replace_remote:
         prev = list_step6_knowledge_files(conn, chat_session_id)
-        if prev:
+        report_fids = list_openai_report_file_ids_for_session(conn, chat_session_id)
+        prev_fids = [r.openai_file_id for r in prev]
+        all_detach = list(dict.fromkeys(prev_fids + report_fids))
+        if all_detach:
             detach_and_delete_openai_knowledge_files(
                 vid,
-                [r.openai_file_id for r in prev],
+                all_detach,
                 delete_remote_file_objects=delete_openai_file_objects,
             )
+        null_all_step6_report_openai_file_ids(conn, chat_session_id, commit=False)
         delete_step6_knowledge_files_for_session(conn, chat_session_id, commit=False)
         conn.commit()
 

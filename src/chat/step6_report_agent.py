@@ -221,6 +221,16 @@ class Step6ReportResult:
     model: str
 
 
+def append_step6_extra_angle_to_context_blob(
+    context_blob: str, extra_angle_context: str | None
+) -> str:
+    """Append a one-off angle section for PARI (e.g. from Discuss regenerate)."""
+    ang = (extra_angle_context or "").strip()
+    if not ang:
+        return context_blob
+    return context_blob + f"\n## One-off report angle (this run only)\n{ang}\n"
+
+
 def run_step6_pari_report(
     conn: sqlite3.Connection,
     chat_session_id: str,
@@ -233,6 +243,7 @@ def run_step6_pari_report(
     on_toc_delta: Callable[[str], None] | None = None,
     on_section_delta: Callable[[str], None] | None = None,
     on_status: Callable[[str], None] | None = None,
+    extra_angle_context: str | None = None,
 ) -> Step6ReportResult:
     """
     Plan → Act (per heading) → Review verse coverage (programmatic + optional LLM) → Appendix.
@@ -249,11 +260,14 @@ def run_step6_pari_report(
     sy_lines = fetch_latest_bot2_display_lines(conn, chat_session_id)
     syn_blob = "\n".join(sy_lines) if sy_lines else "(none)"
 
-    context_blob = (
-        "## Refined question\n"
-        f"{rq}\n\n"
-        "## Bot 1 (topics / connotations JSON)\n```json\n{bot1_json}\n```\n\n"
-        f"## Bot 2 synonyms\n{syn_blob}\n"
+    context_blob = append_step6_extra_angle_to_context_blob(
+        (
+            "## Refined question\n"
+            f"{rq}\n\n"
+            "## Bot 1 (topics / connotations JSON)\n```json\n{bot1_json}\n```\n\n"
+            f"## Bot 2 synonyms\n{syn_blob}\n"
+        ),
+        extra_angle_context,
     )
 
     def status(msg: str) -> None:

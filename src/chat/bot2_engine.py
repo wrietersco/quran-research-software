@@ -1,4 +1,9 @@
-"""Bot 2 — Arabic synonyms for one Bot 1 connotation via Responses API + tool call."""
+"""Bot 2 — Arabic synonyms for one Bot 1 connotation via Responses API + tool call.
+
+Falls back to Chat Completions + function calling when the API key cannot call the
+Responses API (e.g. missing ``api.responses.write`` on a restricted key).
+Set ``OPENAI_BOT2_USE_CHAT_COMPLETIONS=1`` to skip Responses and use Chat Completions only.
+"""
 
 from __future__ import annotations
 
@@ -273,6 +278,135 @@ def _usage_tokens(resp) -> tuple[int | None, int | None, int | None]:
     return inp, out, tot
 
 
+def _usage_tokens_chat(completion) -> tuple[int | None, int | None, int | None]:
+    u = getattr(completion, "usage", None)
+    if not u:
+        return None, None, None
+    return (
+        getattr(u, "prompt_tokens", None),
+        getattr(u, "completion_tokens", None),
+        getattr(u, "total_tokens", None),
+    )
+
+
+def _env_truthy(raw: str | None) -> bool:
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _should_fallback_to_chat_completions(exc: BaseException) -> bool:
+    """Restricted keys often lack Responses API scope (api.responses.write)."""
+    text = f"{exc}"
+    low = text.lower()
+    if "api.responses.write" in text:
+        return True
+    if "insufficient permissions" in low and "scope" in low:
+        return True
+    if "401" in text and ("responses" in low or "permission" in low):
+        return True
+    return False
+
+
+def _bot2_chat_tools() -> list[dict]:
+    t = TOOL_SAVE_SYNONYMS_RESPONSES
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["parameters"],
+            },
+        }
+    ]
+
+
+def _parse_synonyms_from_chat_completion(completion) -> list[str] | None:
+    if not getattr(completion, "choices", None):
+        return None
+    msg = completion.choices[0].message
+    for tc in getattr(msg, "tool_calls", None) or []:
+        fn = getattr(getattr(tc, "function", None), "name", None)
+        if fn != "save_arabic_synonyms":
+            continue
+        raw_args = getattr(getattr(tc, "function", None), "arguments", None)
+        if raw_args is None:
+            continue
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(args, dict):
+            continue
+        got = _dict_from_synonyms_json_value(args.get("synonyms_json"))
+        if got and "synonyms" in got:
+            return _normalize_synonym_list(got.get("synonyms"))
+    content = getattr(msg, "content", None)
+    if content and str(content).strip():
+        direct = _extract_json_object_from_text(str(content))
+        if direct and "synonyms" in direct:
+            return _normalize_synonym_list(direct.get("synonyms"))
+    return None
+
+
+def _run_bot2_chat_completions(
+    client,
+    *,
+    model_name: str,
+    system: str,
+    user_payload: str,
+    max_n: int,
+    temp: float,
+    cancel_event: threading.Event | None,
+) -> Bot2Result:
+    """Same tool contract as Responses API, via chat.completions + function calling."""
+    kwargs: dict = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_payload},
+        ],
+        "tools": _bot2_chat_tools(),
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "save_arabic_synonyms"},
+        },
+        "parallel_tool_calls": False,
+    }
+    if model_allows_temperature(model_name):
+        kwargs["temperature"] = temp
+    try:
+        completion = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        raise Bot2Error(f"OpenAI request failed (chat completions): {e}") from e
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise Bot2Cancelled()
+
+    syns = _parse_synonyms_from_chat_completion(completion)
+    if syns is None:
+        raise Bot2Error(
+            "Could not parse Bot 2 output (chat completions): "
+            "expected save_arabic_synonyms(synonyms_json) or JSON with synonyms.",
+        )
+    syns = syns[:max_n]
+
+    pt, ctok, tt = _usage_tokens_chat(completion)
+    choice = completion.choices[0] if completion.choices else None
+    msg = getattr(choice, "message", None)
+    raw_text = getattr(msg, "content", None) if msg else None
+
+    return Bot2Result(
+        synonyms=syns,
+        model=getattr(completion, "model", None) or model_name,
+        response_id=getattr(completion, "id", None),
+        finish_reason=getattr(choice, "finish_reason", None),
+        prompt_tokens=pt,
+        completion_tokens=ctok,
+        total_tokens=tt,
+        raw_assistant_content=str(raw_text) if raw_text is not None else None,
+    )
+
+
 def run_bot2_synonyms(
     *,
     connotation_text: str,
@@ -287,7 +421,9 @@ def run_bot2_synonyms(
     instructions_base: str | None = None,
 ) -> Bot2Result:
     """
-    Single Responses API call: synonyms for one connotation.
+    Synonyms for one connotation: prefers the Responses API; falls back to Chat Completions
+    if the key cannot use Responses (e.g. missing ``api.responses.write``).
+
     If ``instructions_base`` is set, it is used as the core system block; the app still appends
     the synonym limit and tool-persistence text. Otherwise the saved override or built-in doc is used.
     """
@@ -344,9 +480,38 @@ def run_bot2_synonyms(
     if model_allows_temperature(model_name):
         create_kwargs["temperature"] = temp
 
+    chat_system_suffix = ""
+    if vs_ids:
+        chat_system_suffix = (
+            "\n\n[Note: This run uses Chat Completions (not the Responses API), so "
+            "vector-store file search is unavailable—answer from general knowledge only.]"
+        )
+
+    prefer_chat = _env_truthy(os.environ.get("OPENAI_BOT2_USE_CHAT_COMPLETIONS"))
+    if prefer_chat:
+        return _run_bot2_chat_completions(
+            client,
+            model_name=model_name,
+            system=system + chat_system_suffix,
+            user_payload=user_payload,
+            max_n=max_n,
+            temp=temp,
+            cancel_event=cancel_event,
+        )
+
     try:
         resp = client.responses.create(**create_kwargs)
     except Exception as e:
+        if _should_fallback_to_chat_completions(e):
+            return _run_bot2_chat_completions(
+                client,
+                model_name=model_name,
+                system=system + chat_system_suffix,
+                user_payload=user_payload,
+                max_n=max_n,
+                temp=temp,
+                cancel_event=cancel_event,
+            )
         raise Bot2Error(f"OpenAI request failed: {e}") from e
 
     if cancel_event is not None and cancel_event.is_set():

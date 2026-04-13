@@ -41,3 +41,15 @@ def insert_bot1_run(
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def delete_bot1_analysis_runs_for_session(
+    conn: sqlite3.Connection, chat_session_id: str
+) -> int:
+    """Remove legacy Bot 1 JSON snapshot rows (no FK to chat_sessions). Returns deleted count."""
+    cur = conn.execute(
+        "DELETE FROM bot1_analysis_runs WHERE chat_session_id = ?",
+        (chat_session_id,),
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)

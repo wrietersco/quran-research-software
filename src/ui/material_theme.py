@@ -1,4 +1,4 @@
-"""Material Design 3–inspired colors and ttk styling for the desktop explorer."""
+"""Material Design 3–inspired light colors and ttk styling for the desktop explorer."""
 
 from __future__ import annotations
 
@@ -30,13 +30,22 @@ class MaterialColors:
     tertiary = "#7B1FA2"
     on_surface = "#1B1B1F"
     on_surface_variant = "#44474E"
+    on_surface_subtle = "#5C5F66"
     outline = "#C4C6D0"
+    # Softer edges for chat shells and composer (less harsh than `outline`)
+    chat_shell_border = "#D0D5E0"
+    composer_trough = "#E9EDF4"
     error = "#BA1A1A"
-    on_error_container = "#410002"
+    on_error_container = "#fde8e8"
     success = "#1B5E20"
     # Selection / focus
     selection = "#C8E6E9"
     selection_text = "#003731"
+    # Tree zebra & search highlights (light)
+    tree_zebra_a = "#FFFFFF"
+    tree_zebra_b = "#EEF2F7"
+    tree_hit_a = "#e8f5e9"
+    tree_hit_b = "#f1f8e9"
 
 
 def apply_material_theme(
@@ -84,13 +93,70 @@ def apply_material_theme(
         background=[("selected", C.surface_container)],
         foreground=[("selected", C.primary)],
     )
+    # Step strip inside analysis — calmer tabs, clearer selected state
+    st.configure("Pipeline.TNotebook", background=C.surface, borderwidth=0)
+    st.configure(
+        "Pipeline.TNotebook.Tab",
+        padding=[16, 8],
+        font=(latin_family, tab),
+        background=C.surface_dim,
+        foreground=C.on_surface_variant,
+        borderwidth=0,
+    )
+    st.map(
+        "Pipeline.TNotebook.Tab",
+        background=[
+            ("selected", C.surface_container),
+            ("active", C.surface_container_high),
+        ],
+        foreground=[("selected", C.primary), ("active", C.on_surface)],
+    )
     st.configure("TLabel", background=C.surface, font=(latin_family, body), foreground=C.on_surface)
-    st.configure("TButton", font=(latin_family, body))
-    st.configure("TSpinbox", font=(latin_family, body), fieldbackground=C.surface_container)
-    st.configure("TCombobox", font=(latin_family, body), fieldbackground=C.surface_container)
+    st.configure(
+        "TButton",
+        font=(latin_family, body),
+        background=C.surface_container_high,
+        foreground=C.on_surface,
+        borderwidth=0,
+        focusthickness=1,
+        focuscolor=C.outline,
+        padding=(10, 6),
+    )
+    st.map(
+        "TButton",
+        background=[
+            ("disabled", C.surface_dim),
+            ("pressed", "#D0D5DD"),
+            ("active", "#E2E6ED"),
+        ],
+        foreground=[("disabled", C.on_surface_variant)],
+    )
+    st.configure(
+        "TSpinbox",
+        font=(latin_family, body),
+        fieldbackground=C.surface_container,
+        foreground=C.on_surface,
+        borderwidth=0,
+        arrowcolor=C.on_surface_variant,
+    )
+    st.map("TSpinbox", fieldbackground=[("readonly", C.surface_container)])
+    st.configure(
+        "TCombobox",
+        font=(latin_family, body),
+        fieldbackground=C.surface_container,
+        foreground=C.on_surface,
+        borderwidth=0,
+        arrowcolor=C.on_surface_variant,
+    )
+    st.map("TCombobox", fieldbackground=[("readonly", C.surface_container)])
     st.configure("TPanedwindow", background=C.surface)
     st.configure("TLabelframe", background=C.surface, foreground=C.primary)
-    st.configure("TLabelframe.Label", background=C.surface, foreground=C.primary, font=(latin_family, body, "bold"))
+    st.configure(
+        "TLabelframe.Label",
+        background=C.surface,
+        foreground=C.primary,
+        font=(latin_family, body, "bold"),
+    )
     st.configure(
         "Treeview",
         font=(arabic_family, browse_size),
@@ -141,6 +207,48 @@ def apply_material_theme(
         padding=(6, 8),
     )
     st.map("Browse.Treeview", background=[("selected", C.selection)], foreground=[("selected", C.selection_text)])
+    st.configure(
+        "FVPipeline.Treeview",
+        font=(arabic_family, browse_size),
+        rowheight=browse_row_h,
+        background=C.surface_container,
+        fieldbackground=C.surface_container,
+        foreground=C.on_surface,
+    )
+    st.configure(
+        "FVPipeline.Treeview.Heading",
+        font=(latin_family, tab, "bold"),
+        background=C.surface_dim,
+        foreground=C.on_surface,
+        relief="flat",
+        padding=(6, 8),
+    )
+    st.map(
+        "FVPipeline.Treeview",
+        background=[("selected", C.selection)],
+        foreground=[("selected", C.selection_text)],
+    )
+    st.configure(
+        "Step4.Treeview",
+        font=(arabic_family, browse_size),
+        rowheight=browse_row_h,
+        background=C.surface_container,
+        fieldbackground=C.surface_container,
+        foreground=C.on_surface,
+    )
+    st.configure(
+        "Step4.Treeview.Heading",
+        font=(latin_family, tab, "bold"),
+        background=C.surface_dim,
+        foreground=C.on_surface,
+        relief="flat",
+        padding=(6, 8),
+    )
+    st.map(
+        "Step4.Treeview",
+        background=[("selected", C.selection)],
+        foreground=[("selected", C.selection_text)],
+    )
     st.configure("Horizontal.TScrollbar", troughcolor=C.surface_dim, borderwidth=0)
     st.configure("Vertical.TScrollbar", troughcolor=C.surface_dim, borderwidth=0)
 
@@ -151,7 +259,7 @@ def apply_material_theme(
         "HeroTitle.TLabel",
         background=C.primary_container,
         foreground=C.on_primary_container,
-        font=(latin_family, 17, "bold"),
+        font=(latin_family, 18, "bold"),
     )
     st.configure(
         "HeroMeta.TLabel",
@@ -192,16 +300,47 @@ def apply_material_theme(
         foreground=[("disabled", C.on_surface_variant)],
     )
     st.configure(
+        "SessionTool.TButton",
+        font=(latin_family, body),
+        background=C.surface_container,
+        foreground=C.primary,
+        borderwidth=0,
+        focusthickness=1,
+        focuscolor=C.primary_container,
+        padding=(10, 8),
+    )
+    st.map(
+        "SessionTool.TButton",
+        background=[
+            ("disabled", C.surface_dim),
+            ("pressed", C.surface_dim),
+            ("active", C.surface_container_high),
+        ],
+        foreground=[("disabled", C.on_surface_variant)],
+    )
+    st.configure(
         "SectionHeading.TLabel",
         background=C.surface_container,
         foreground=C.on_surface,
         font=(latin_family, 11, "bold"),
     )
     st.configure(
+        "ChatSection.TLabel",
+        background=C.surface_container,
+        foreground=C.on_surface_variant,
+        font=(latin_family, 10, "bold"),
+    )
+    st.configure(
         "Hint.TLabel",
         background=C.surface_container,
         foreground=C.on_surface_variant,
         font=(latin_family, 9),
+    )
+    st.configure(
+        "ChatIntro.TLabel",
+        background=C.surface_container,
+        foreground=C.on_surface_variant,
+        font=(latin_family, 10),
     )
     st.configure(
         "TProgressbar",
@@ -260,6 +399,36 @@ def apply_material_theme(
     }
 
 
+def style_mpl_figure(fig: Any) -> None:
+    """Apply current theme colors to a matplotlib Figure (embedded charts)."""
+    C = MaterialColors
+    try:
+        fig.patch.set_facecolor(C.surface)
+        for ax in fig.axes:
+            ax.set_facecolor(C.surface)
+            ax.tick_params(colors=C.on_surface_variant)
+            ax.xaxis.label.set_color(C.on_surface_variant)
+            ax.yaxis.label.set_color(C.on_surface_variant)
+            t = ax.title
+            if t is not None and t.get_text():
+                t.set_color(C.on_surface)
+            for spine in ax.spines.values():
+                spine.set_color(C.outline)
+            leg = ax.get_legend()
+            if leg is not None:
+                leg.get_frame().set_facecolor(C.surface_container)
+                leg.get_frame().set_edgecolor(C.outline)
+                for txt in leg.get_texts():
+                    txt.set_color(C.on_surface)
+    except Exception:
+        pass
+
+
+# Backwards compatibility
+def style_mpl_figure_dark(fig: Any) -> None:
+    style_mpl_figure(fig)
+
+
 def style_tk_listbox(
     listbox: tk.Listbox,
     *,
@@ -275,7 +444,7 @@ def style_tk_listbox(
         selectforeground=C.on_primary,
         activestyle="none",
         highlightthickness=0,
-        borderwidth=1,
+        borderwidth=0,
         relief="flat",
     )
 
@@ -287,9 +456,11 @@ def style_tk_text_readonly(
     size: int,
     monospace: bool = False,
     subtle: bool = False,
+    soft_border: bool = False,
 ) -> None:
     C = MaterialColors
     bg = C.surface_container_high if subtle else C.surface_container
+    border = C.chat_shell_border if soft_border else C.outline
     widget.configure(
         font=("Consolas", size) if monospace else (family, size),
         bg=bg,
@@ -297,9 +468,25 @@ def style_tk_text_readonly(
         insertbackground=C.primary,
         relief="flat",
         highlightthickness=1,
-        highlightbackground=C.outline,
+        highlightbackground=border,
         highlightcolor=C.primary,
-        padx=12,
+        padx=14,
+        pady=14,
+    )
+
+
+def style_tk_text_composer_input(widget: tk.Text, *, family: str, size: int) -> None:
+    """Single-line–style field inside the composer bar (no inner focus ring)."""
+    C = MaterialColors
+    widget.configure(
+        font=(family, size),
+        bg=C.surface_container,
+        fg=C.on_surface,
+        insertbackground=C.primary,
+        relief="flat",
+        highlightthickness=0,
+        borderwidth=0,
+        padx=14,
         pady=12,
     )
 

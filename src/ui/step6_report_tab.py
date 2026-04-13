@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -23,8 +24,10 @@ from src.chat.session_vector_store import (
 from src.chat.step6_exports import write_all_formats
 from src.chat.step6_knowledge_export import (
     clear_session_step6_knowledge,
+    index_report_markdown_on_session_vector_store,
     replace_knowledge_on_vector_store,
 )
+from src.chat.step6_report_chat_agent import run_step6_report_chat_turn
 from src.chat.llm_pricing import split_cost_usd
 from src.chat.step6_report_agent import run_step6_pari_report
 from src.chat.step6_ui_settings import (
@@ -39,8 +42,11 @@ from src.config import get_db_path
 from src.db.chat_pipeline import get_chat_session_openai_vector_store_id, upsert_chat_session
 from src.db.connection import connect
 from src.db.step6_report import (
+    insert_step6_report_chat_message,
     insert_step6_report_run,
     latest_step6_report_run,
+    list_step6_report_chat_messages,
+    list_step6_report_runs,
     update_step6_report_run,
 )
 from src.openai_platform.resources import OpenAIAdminError
@@ -65,10 +71,13 @@ class Step6ReportPane:
         self._top_nb.pack(fill=BOTH, expand=True)
         run_fr = ttk.Frame(self._top_nb)
         cfg_fr = ttk.Frame(self._top_nb)
+        disc_fr = ttk.Frame(self._top_nb)
         self._top_nb.add(run_fr, text="Run")
         self._top_nb.add(cfg_fr, text="Configure")
+        self._top_nb.add(disc_fr, text="Discuss")
         self._build_run_tab(run_fr)
         self._build_configure_tab(cfg_fr)
+        self._build_discuss_tab(disc_fr)
 
     def _build_run_tab(self, tab: ttk.Frame) -> None:
         host = self._host
@@ -276,6 +285,301 @@ class Step6ReportPane:
             side=tk.LEFT, padx=(0, 8)
         )
 
+    def _build_discuss_tab(self, tab: ttk.Frame) -> None:
+        lf = self._lf()
+        hdr = ttk.Label(
+            tab,
+            text="Discuss — report assistant (PARI)",
+            font=(lf[0], 12, "bold"),
+        )
+        hdr.pack(anchor="w", padx=6, pady=(6, 4))
+        ttk.Label(
+            tab,
+            text=(
+                "Chat answers are short and conversational (not mini-reports). "
+                "A **new PARI report** runs only when you clearly ask for one (e.g. write a new report, "
+                "rewrite the report, run PARI again)."
+            ),
+            wraplength=720,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=6, pady=(0, 4))
+
+        outer = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        outer.pack(fill=BOTH, expand=True, padx=6, pady=6)
+
+        left = ttk.Labelframe(outer, text="Report runs")
+        right = ttk.Labelframe(outer, text="Chat")
+        outer.add(left, weight=0)
+        outer.add(right, weight=1)
+
+        self._report_list_ids: list[int] = []
+        self._report_listbox = tk.Listbox(left, height=18, font=("Consolas", 9))
+        sb_l = ttk.Scrollbar(left, command=self._report_listbox.yview)
+        self._report_listbox.configure(yscrollcommand=sb_l.set)
+        self._report_listbox.pack(side=tk.LEFT, fill=BOTH, expand=True, padx=(4, 0), pady=4)
+        sb_l.pack(side=tk.RIGHT, fill=tk.Y, pady=4)
+
+        br = ttk.Frame(left)
+        br.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Button(br, text="Open HTML", command=self._discuss_open_html).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(br, text="Open folder", command=self._discuss_open_folder).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(br, text="Refresh list", command=self._refresh_report_runs_list).pack(side=tk.LEFT)
+
+        self._discuss_chat = scrolledtext.ScrolledText(
+            right, height=16, wrap=tk.WORD, font=("Segoe UI", 10), state="disabled"
+        )
+        self._discuss_chat.pack(fill=BOTH, expand=True, padx=4, pady=4)
+
+        inp_fr = ttk.Frame(right)
+        inp_fr.pack(fill=tk.X, padx=4, pady=(0, 6))
+        self._discuss_input = tk.Text(inp_fr, height=4, wrap=tk.WORD, font=("Segoe UI", 10))
+        self._discuss_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self._discuss_send_btn = ttk.Button(inp_fr, text="Send", command=self._on_discuss_send, width=10)
+        self._discuss_send_btn.pack(side=tk.RIGHT)
+
+    def _append_discuss_chat(self, role: str, text: str) -> None:
+        w = self._discuss_chat
+        w.configure(state="normal")
+        w.insert(END, f"{role.upper()}\n{text}\n\n")
+        w.configure(state="disabled")
+        w.see(END)
+
+    def _reload_discuss_chat_log(self) -> None:
+        w = self._discuss_chat
+        w.configure(state="normal")
+        w.delete("1.0", END)
+        w.configure(state="disabled")
+        sid = self._sid()
+        if not sid:
+            return
+        try:
+            conn = connect(get_db_path())
+            try:
+                rows = list_step6_report_chat_messages(conn, sid)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            return
+        for m in rows:
+            self._append_discuss_chat(m.role, m.content)
+
+    def _refresh_report_runs_list(self) -> None:
+        if not hasattr(self, "_report_listbox"):
+            return
+        self._report_listbox.delete(0, END)
+        self._report_list_ids.clear()
+        sid = self._sid()
+        if not sid:
+            return
+        try:
+            conn = connect(get_db_path())
+            try:
+                runs = list_step6_report_runs(conn, sid, newest_first=True)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            return
+        for r in runs:
+            self._report_list_ids.append(r.id)
+            ts = (r.created_at or "")[:19]
+            mpart = (r.model or "")[:28]
+            self._report_listbox.insert(END, f"#{r.id}  {r.status}  {ts}  {mpart}")
+
+    def _discuss_selected_run_id(self) -> int | None:
+        if not hasattr(self, "_report_listbox"):
+            return None
+        sel = self._report_listbox.curselection()
+        if not sel:
+            return None
+        i = int(sel[0])
+        if 0 <= i < len(self._report_list_ids):
+            return self._report_list_ids[i]
+        return None
+
+    def _path_for_report_run(self, run_id: int) -> Path | None:
+        sid = self._sid()
+        if not sid:
+            return None
+        try:
+            conn = connect(get_db_path())
+            try:
+                runs = list_step6_report_runs(conn, sid, newest_first=False)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            return None
+        for r in runs:
+            if r.id == run_id and r.report_dir:
+                return Path(r.report_dir)
+        return None
+
+    def _discuss_open_html(self) -> None:
+        host = self._host
+        rid = self._discuss_selected_run_id()
+        if rid is None:
+            messagebox.showinfo("Step 6", "Select a report run in the list.", parent=host._root)
+            return
+        base = self._path_for_report_run(rid)
+        if not base or not base.is_dir():
+            messagebox.showinfo("Step 6", "No folder for this run.", parent=host._root)
+            return
+        p = base / "report.html"
+        if p.is_file():
+            webbrowser.open(p.as_uri())
+        else:
+            messagebox.showinfo("Step 6", "report.html not found for this run.", parent=host._root)
+
+    def _discuss_open_folder(self) -> None:
+        host = self._host
+        rid = self._discuss_selected_run_id()
+        if rid is None:
+            messagebox.showinfo("Step 6", "Select a report run in the list.", parent=host._root)
+            return
+        base = self._path_for_report_run(rid)
+        if not base or not base.is_dir():
+            messagebox.showinfo("Step 6", "No folder for this run.", parent=host._root)
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(base)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(base)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(base)], check=False)
+        except OSError as e:
+            messagebox.showerror("Step 6", str(e), parent=host._root)
+
+    def _on_discuss_send(self) -> None:
+        host = self._host
+        if getattr(host, "_busy", False):
+            return
+        sid = self._sid()
+        if not sid:
+            messagebox.showinfo("Step 6", "Select a session first.", parent=host._root)
+            return
+        raw = self._discuss_input.get("1.0", END).strip()
+        if not raw:
+            return
+        self._discuss_input.delete("1.0", END)
+        ss = self._gather_settings()
+        try:
+            conn = connect(get_db_path())
+            try:
+                upsert_chat_session(conn, sid, self._title())
+                vid = get_chat_session_openai_vector_store_id(conn, sid)
+                if not vid:
+                    vid = ensure_session_vector_store_in_db(conn, sid, self._title())
+                insert_step6_report_chat_message(conn, chat_session_id=sid, role="user", content=raw)
+                msgs = list_step6_report_chat_messages(conn, sid)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error) as e:
+            messagebox.showerror("Step 6", str(e), parent=host._root)
+            return
+        if not vid:
+            messagebox.showwarning(
+                "Step 6",
+                "No vector store for this session. Run **Load knowledge** first.",
+                parent=host._root,
+            )
+            return
+        self._reload_discuss_chat_log()
+        model = (self._model_var.get() or "").strip() or None
+        cancel = getattr(host, "_cancel_bot_work", None)
+        if cancel is not None:
+            cancel.clear()
+
+        conv = [(m.role, m.content) for m in msgs]
+
+        def work() -> None:
+            err: str | None = None
+            result = None
+            try:
+                result = run_step6_report_chat_turn(
+                    vector_store_id=vid,
+                    conversation=conv,
+                    settings=ss,
+                    model=model,
+                    cancel_event=cancel,
+                )
+            except Exception as e:
+                err = str(e)
+
+            def done() -> None:
+                if err:
+                    host._end_busy("Discuss — error.")
+                    self._append_discuss_chat("assistant", f"(Error) {err}")
+                    try:
+                        c2 = connect(get_db_path())
+                        try:
+                            insert_step6_report_chat_message(
+                                c2,
+                                chat_session_id=sid,
+                                role="assistant",
+                                content=f"(Error) {err}",
+                            )
+                        finally:
+                            c2.close()
+                    except (OSError, sqlite3.Error):
+                        pass
+                    messagebox.showerror("Step 6 — Discuss", err, parent=host._root)
+                    return
+                if result is None:
+                    host._end_busy("")
+                    return
+                meta = None
+                if result.prompt_tokens or result.completion_tokens:
+                    meta = json.dumps(
+                        {
+                            "intent": result.intent_json,
+                            "prompt_tokens": result.prompt_tokens,
+                            "completion_tokens": result.completion_tokens,
+                            "model": result.model,
+                        },
+                        ensure_ascii=False,
+                    )
+                self._append_discuss_chat("assistant", result.assistant_markdown)
+                try:
+                    c2 = connect(get_db_path())
+                    try:
+                        insert_step6_report_chat_message(
+                            c2,
+                            chat_session_id=sid,
+                            role="assistant",
+                            content=result.assistant_markdown,
+                            meta_json=meta,
+                        )
+                    finally:
+                        c2.close()
+                except (OSError, sqlite3.Error) as pe:
+                    messagebox.showerror("Step 6", str(pe), parent=host._root)
+                mname = (result.model or "").strip() or "gpt-4o-mini"
+                cin, cout, _ = split_cost_usd(
+                    "openai",
+                    mname,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                )
+                host._pipeline_step_finish_from_partial(
+                    sid,
+                    6,
+                    agent=True,
+                    in_tok=int(result.prompt_tokens),
+                    out_tok=int(result.completion_tokens),
+                    in_usd=cin,
+                    out_usd=cout,
+                    models=f"Discuss — {mname}",
+                )
+                host._end_busy("Discuss — done.")
+                if result.kind == "regenerate":
+                    ang = (result.regenerate_angle or "").strip()
+                    self._on_write(extra_angle_context=ang or None)
+
+            host._root.after(0, done)
+
+        host._begin_busy("Step 6 — Discuss…", op="step6")
+        threading.Thread(target=work, daemon=True).start()
+
     def _text_set(self, w: scrolledtext.ScrolledText, s: str) -> None:
         w.delete("1.0", END)
         w.insert("1.0", s)
@@ -376,8 +680,8 @@ class Step6ReportPane:
             return
         if not messagebox.askyesno(
             "Step 6",
-            "Remove all Step 6 knowledge file attachments for this session from the "
-            "vector store and database?",
+            "Remove all Step 6 knowledge chunks and indexed report files from the "
+            "session vector store (OpenAI) and clear the related database rows?",
             parent=host._root,
         ):
             return
@@ -433,6 +737,9 @@ class Step6ReportPane:
             self._vs_var.set(
                 "Vector store: not created yet (new session may still be provisioning; use Load to retry)"
             )
+        if hasattr(self, "_report_listbox"):
+            self._refresh_report_runs_list()
+            self._reload_discuss_chat_log()
 
     def _on_stop(self) -> None:
         ev = getattr(self._host, "_cancel_bot_work", None)
@@ -510,7 +817,7 @@ class Step6ReportPane:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_write(self) -> None:
+    def _on_write(self, extra_angle_context: str | None = None) -> None:
         host = self._host
         if getattr(host, "_busy", False):
             return
@@ -520,6 +827,7 @@ class Step6ReportPane:
             return
         title = self._title()
         ss = self._gather_settings()
+        angle_for_run = (extra_angle_context or "").strip() or None
         try:
             conn = connect(get_db_path())
             try:
@@ -591,6 +899,7 @@ class Step6ReportPane:
 
         def work() -> None:
             err_msg: str | None = None
+            index_err: str | None = None
             run_id: int | None = None
             out_dir: Path | None = None
             pari_result = None
@@ -618,6 +927,7 @@ class Step6ReportPane:
                         on_toc_delta=queue_toc_delta,
                         on_section_delta=queue_sec_delta,
                         on_status=queue_status,
+                        extra_angle_context=angle_for_run,
                     )
                 finally:
                     conn2.close()
@@ -637,6 +947,19 @@ class Step6ReportPane:
                         report_dir=str(out.resolve()),
                         commit=True,
                     )
+                    md_path = paths.get("md")
+                    if md_path and md_path.is_file() and run_id is not None:
+                        try:
+                            index_report_markdown_on_session_vector_store(
+                                conn3,
+                                sid,
+                                title,
+                                md_path,
+                                run_id,
+                                commit=True,
+                            )
+                        except OpenAIAdminError as e:
+                            index_err = str(e)
                 finally:
                     conn3.close()
             except RuntimeError as e:
@@ -741,9 +1064,20 @@ class Step6ReportPane:
                 elif err_msg:
                     messagebox.showerror("Step 6 — Write", err_msg, parent=host._root)
                 elif out_dir:
-                    self._status_var.set(f"Saved under {out_dir}")
+                    msg = f"Saved under {out_dir}"
+                    if index_err:
+                        msg += f" (vector index warning: {index_err})"
+                    self._status_var.set(msg)
+                    if index_err:
+                        messagebox.showwarning(
+                            "Step 6 — Index",
+                            "Report files were saved, but indexing report.md on the vector store failed:\n"
+                            f"{index_err}",
+                            parent=host._root,
+                        )
                     if self._paths.get("html"):
                         webbrowser.open(self._paths["html"].as_uri())
+                self._refresh_report_runs_list()
 
             host._root.after(0, done)
 

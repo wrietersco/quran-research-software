@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -36,9 +37,13 @@ from src.chat.refine_engine import (  # noqa: E402
     refine_reply,
     split_assistant_for_display,
 )
+from src.chat.openai_health import check_openai_api_health  # noqa: E402
 from src.config import get_db_path  # noqa: E402  (also loads .env)
+from src.chat.session_cleanup import (  # noqa: E402
+    delete_session_database_side,
+    delete_session_files_on_disk,
+)
 from src.db.chat_pipeline import (  # noqa: E402
-    delete_chat_session_pipeline,
     fetch_latest_bot1_analysis_dict,
     insert_bot1_step_run,
     refined_question_text_for_session,
@@ -71,6 +76,33 @@ app = FastAPI(
     ),
     version="0.1.0",
 )
+
+# Last OpenAI connectivity probe (updated at startup and via GET /api/health)
+_openai_health_state: dict[str, object] = {
+    "ok": None,
+    "summary": "pending",
+    "detail": None,
+}
+
+
+def _probe_openai_health_background() -> None:
+    def run() -> None:
+        try:
+            r = check_openai_api_health()
+            _openai_health_state["ok"] = r.ok
+            _openai_health_state["summary"] = r.summary
+            _openai_health_state["detail"] = r.detail
+        except Exception as e:
+            _openai_health_state["ok"] = False
+            _openai_health_state["summary"] = "error"
+            _openai_health_state["detail"] = str(e)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.on_event("startup")
+def _startup_probe_openai() -> None:
+    _probe_openai_health_background()
 
 # ---------------------------------------------------------------------------
 # DB dependency
@@ -270,8 +302,31 @@ class FindVersesResponse(BaseModel):
 # ===================================================================
 
 @app.get("/api/health")
-def health() -> dict:
-    return {"status": "ok", "db_path": str(get_db_path())}
+def health(probe_openai: bool = False) -> dict:
+    """
+    Liveness and DB path. OpenAI status is filled at startup; pass ``probe_openai=true``
+    to run a fresh authenticated request (same probe as the desktop “Check API” button).
+    """
+    if probe_openai:
+        try:
+            r = check_openai_api_health()
+            _openai_health_state["ok"] = r.ok
+            _openai_health_state["summary"] = r.summary
+            _openai_health_state["detail"] = r.detail
+        except Exception as e:
+            _openai_health_state["ok"] = False
+            _openai_health_state["summary"] = "error"
+            _openai_health_state["detail"] = str(e)
+
+    return {
+        "status": "ok",
+        "db_path": str(get_db_path()),
+        "openai": {
+            "ok": _openai_health_state.get("ok"),
+            "summary": _openai_health_state.get("summary"),
+            "detail": _openai_health_state.get("detail"),
+        },
+    }
 
 
 @app.post("/api/refine", response_model=RefineResponse)
@@ -387,7 +442,8 @@ def api_create_session(
 def api_delete_session(
     session_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> None:
-    delete_chat_session_pipeline(conn, session_id)
+    delete_session_database_side(conn, session_id)
+    delete_session_files_on_disk(session_id)
 
 
 @app.post("/api/sessions/{session_id}/refined-question")

@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import BOTH, END, VERTICAL, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from src.ui.material_theme import MaterialColors
+from src.ui.material_theme import MaterialColors, style_mpl_figure
 
 
 @dataclass
@@ -249,7 +249,7 @@ class PipelineSummaryPane:
             ttk.Label(holder, text="No recorded steps yet.").pack(anchor="w")
             return
 
-        fig = Figure(figsize=(9.2, 3.6), dpi=100, facecolor="#f4f6f8")
+        fig = Figure(figsize=(9.2, 3.6), dpi=100, facecolor=MaterialColors.surface)
         ax_c, ax_t = fig.subplots(1, 2)
         colors = ["#1565c0", "#2e7d32", "#6a1b9a", "#ef6c00", "#c62828", "#00838f"]
         x = range(len(steps))
@@ -270,6 +270,7 @@ class PipelineSummaryPane:
         ax_t.grid(axis="y", linestyle=":", alpha=0.55)
 
         fig.tight_layout()
+        style_mpl_figure(fig)
         canvas = FigureCanvasTkAgg(fig, master=holder)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=BOTH, expand=True)

@@ -37,6 +37,8 @@ def _normalize_for_match(s: str) -> str:
 
 
 _MIN_FULL_QURAN_TOKEN_ROWS = 1000
+# Single-token substring pass: avoid matching particles like في/و inside longer words
+_MIN_SINGLE_TOKEN_SUBSTRING_CHARS = 3
 
 
 def _quran_json_path() -> Path:
@@ -236,18 +238,42 @@ def find_matching_ayahs(
     ayah_tokens: dict[tuple[int, int], list[str]],
     parts: list[str],
 ) -> list[tuple[int, int]]:
-    """Ayat where a contiguous subsequence of match-normalized tokens equals parts (one hit per ayah max)."""
+    """
+    Ayat where a contiguous subsequence of match-normalized tokens equals parts (one hit per ayah max).
+
+    For a **single-token** query whose normalized form has length >=
+    ``_MIN_SINGLE_TOKEN_SUBSTRING_CHARS``, we also match an ayah when some **longer** token contains
+    that string as a substring (e.g. ``نفس`` matches corpus token ``الانفس`` for 39:42). Multi-word
+    queries still require exact contiguous token-sequence equality only.
+    """
     if not parts:
         return []
     n = len(parts)
     hits: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
     for (su, ay), toks in ayah_tokens.items():
         if len(toks) < n:
             continue
         for start in range(len(toks) - n + 1):
             if toks[start : start + n] == parts:
-                hits.append((su, ay))
+                key = (su, ay)
+                if key not in seen:
+                    hits.append(key)
+                    seen.add(key)
                 break
+    if (
+        n == 1
+        and len(parts[0]) >= _MIN_SINGLE_TOKEN_SUBSTRING_CHARS
+    ):
+        needle = parts[0]
+        for (su, ay), toks in ayah_tokens.items():
+            if (su, ay) in seen:
+                continue
+            for tok in toks:
+                if needle != tok and needle in tok:
+                    hits.append((su, ay))
+                    seen.add((su, ay))
+                    break
     return hits
 
 

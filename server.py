@@ -8,6 +8,7 @@ Run from project root:
 from __future__ import annotations
 
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import BOTH, END, VERTICAL, messagebox, ttk
@@ -23,6 +24,7 @@ from src.ui.material_theme import MaterialColors, apply_material_theme  # noqa: 
 
 _ARABIC_UI_FAMILY, _LATIN_UI_FAMILY = ensure_ui_fonts_ready(ROOT)
 
+from src.chat.openai_health import OpenAiHealthResult, check_openai_api_health  # noqa: E402
 from src.config import get_db_path  # noqa: E402
 from src.db.connection import connect  # noqa: E402
 from src.db.introspection import (  # noqa: E402
@@ -103,7 +105,29 @@ class DbExplorerApp:
         if ref_img:
             refresh_kw["image"] = ref_img
             refresh_kw["compound"] = "left"
-        ttk.Button(top, **refresh_kw).pack(side="right")
+
+        right_bar = ttk.Frame(top)
+        right_bar.pack(side="right")
+        ttk.Button(right_bar, **refresh_kw).pack(side="right")
+        self._openai_check_btn = ttk.Button(
+            right_bar,
+            text="Check API",
+            command=self._on_openai_health_check,
+        )
+        self._openai_check_btn.pack(side="right", padx=(0, 8))
+        self._openai_health_var = tk.StringVar(value="OpenAI: checking…")
+        self._last_openai_health_detail: str | None = None
+        self._openai_health_lbl = tk.Label(
+            right_bar,
+            textvariable=self._openai_health_var,
+            font=(_LATIN_UI_FAMILY, 9),
+            bg=MaterialColors.surface,
+            fg=MaterialColors.on_surface_variant,
+        )
+        self._openai_health_lbl.pack(side="right", padx=(0, 8))
+        self._openai_health_lbl.bind(
+            "<Double-Button-1>", self._on_openai_health_detail_dclick
+        )
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))
@@ -217,6 +241,55 @@ class DbExplorerApp:
             self._reload_navigation()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.root.after(200, self._schedule_startup_openai_health)
+
+    def _schedule_startup_openai_health(self) -> None:
+        self._run_openai_health_async(from_user=False)
+
+    def _on_openai_health_check(self) -> None:
+        self._run_openai_health_async(from_user=True)
+
+    def _on_openai_health_detail_dclick(self, _event: tk.Event | None = None) -> None:
+        if self._last_openai_health_detail:
+            messagebox.showinfo("OpenAI API", self._last_openai_health_detail)
+
+    def _run_openai_health_async(self, *, from_user: bool) -> None:
+        def work() -> None:
+            try:
+                result = check_openai_api_health()
+            except Exception as e:
+                result = OpenAiHealthResult(
+                    ok=False, summary="Check failed", detail=str(e)
+                )
+            self.root.after(0, lambda: self._apply_openai_health_result(result))
+
+        if from_user:
+            self._openai_health_var.set("OpenAI: checking…")
+            self._openai_health_lbl.configure(fg=MaterialColors.on_surface_variant)
+            self._last_openai_health_detail = None
+        try:
+            self._openai_check_btn.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_openai_health_result(self, r: OpenAiHealthResult) -> None:
+        try:
+            self._openai_check_btn.configure(state="normal")
+        except tk.TclError:
+            pass
+        if r.ok:
+            self._openai_health_var.set("OpenAI: OK")
+            self._openai_health_lbl.configure(fg=MaterialColors.success)
+            self._last_openai_health_detail = (
+                "The API key can access the OpenAI API (models list succeeded)."
+            )
+        else:
+            self._openai_health_var.set(f"OpenAI: {r.summary}")
+            self._openai_health_lbl.configure(fg=MaterialColors.error)
+            self._last_openai_health_detail = r.detail or r.summary
 
     def _on_close(self) -> None:
         try:

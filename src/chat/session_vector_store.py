@@ -13,6 +13,7 @@ from src.db.chat_pipeline import (
     upsert_chat_session,
 )
 from src.db.connection import connect
+from src.db.step6_report import list_openai_report_file_ids_for_session
 from src.openai_platform.resources import (
     OpenAIAdminError,
     create_vector_store,
@@ -22,12 +23,26 @@ from src.openai_platform.resources import (
 )
 
 
+def session_data_root(chat_session_id: str) -> Path:
+    """Root directory for all on-disk artifacts for one chat session."""
+    return PROJECT_ROOT / "data" / "sessions" / chat_session_id
+
+
 def session_knowledge_dir(chat_session_id: str) -> Path:
-    return PROJECT_ROOT / "data" / "sessions" / chat_session_id / "knowledge"
+    return session_data_root(chat_session_id) / "knowledge"
 
 
 def session_reports_dir(chat_session_id: str) -> Path:
-    return PROJECT_ROOT / "data" / "sessions" / chat_session_id / "reports"
+    return session_data_root(chat_session_id) / "reports"
+
+
+def delete_session_local_data_directory(chat_session_id: str) -> None:
+    """Remove ``data/sessions/<id>/`` (knowledge chunks, reports, etc.). Best-effort."""
+    import shutil
+
+    root = session_data_root(chat_session_id)
+    if root.is_dir():
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def ensure_session_vector_store_in_db(
@@ -122,7 +137,9 @@ def cleanup_openai_session_resources_before_db_delete(
         "SELECT openai_file_id FROM step6_knowledge_files WHERE chat_session_id = ?",
         (chat_session_id,),
     ).fetchall()
-    fids = [str(r["openai_file_id"]) for r in rows if r["openai_file_id"]]
+    kf = [str(r["openai_file_id"]) for r in rows if r["openai_file_id"]]
+    rf = list_openai_report_file_ids_for_session(conn, chat_session_id)
+    fids = list(dict.fromkeys(kf + rf))
     detach_and_delete_openai_knowledge_files(vid, fids)
     try:
         delete_vector_store(vid)

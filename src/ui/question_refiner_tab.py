@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -90,16 +91,28 @@ from src.chat.refine_engine import (
     save_refiner_base_instructions,
     split_assistant_for_display,
 )
-from src.chat.session_vector_store import (
-    cleanup_openai_session_resources_before_db_delete,
-    create_session_vector_store_async,
+from src.chat.session_cleanup import (
+    SESSION_DELETE_STEP_LABELS,
+    run_session_deletion_desktop,
 )
+from src.chat.session_vector_store import create_session_vector_store_async
+from src.ui.session_delete_progress import SessionDeleteProgressDialog
 from src.chat.sessions_store import ChatSessionsStore
 from src.config import (  # loads `.env` on first import (see config._load_dotenv)
     PROJECT_ROOT,
     RAW_QURAN_DIR,
     get_db_path,
 )
+
+# Step 3 pipeline table: whole-field surah:ayah filter (e.g. "6:40", " 12 : 255 ")
+_FV_TABLE_SURAH_AYAH_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+
+
+def _parse_fv_table_surah_ayah(q: str) -> tuple[int, int] | None:
+    m = _FV_TABLE_SURAH_AYAH_RE.match(q.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
 from src.db.bot2_synonyms import (
     ConnotationWorkItem,
     bot1_connotation_ids_with_bot2_for_bot1_run,
@@ -122,7 +135,6 @@ from src.db.find_verses import (
     search_arabic_text_in_quran,
 )
 from src.db.chat_pipeline import (
-    delete_chat_session_pipeline,
     fetch_latest_bot1_analysis_dict,
     insert_bot1_step_run,
     refined_question_id_for_session,
@@ -141,10 +153,7 @@ from src.db.verse_hierarchy import (
     fetch_lane_lexicon_for_morph_root,
     fetch_morpheme_roots_for_token_ids,
 )
-from src.db.question_refiner_messages import (
-    delete_messages_for_session,
-    insert_question_refiner_message,
-)
+from src.db.question_refiner_messages import insert_question_refiner_message
 from src.db.step5_synthesis import (
     Step5MatchRow,
     Step5RequestStats,
@@ -176,7 +185,14 @@ from src.db.step5_synthesis import (
 from src.ui.app_icons import AppIconSet
 from src.ui.arabic_display import shape_arabic_display
 from src.ui.lexicon_display import entry_dialog_title, heading_display_label
-from src.ui.material_theme import MaterialColors, style_tk_listbox, style_tk_text_input, style_tk_text_readonly
+from src.ui.material_theme import (
+    MaterialColors,
+    style_mpl_figure,
+    style_tk_listbox,
+    style_tk_text_composer_input,
+    style_tk_text_input,
+    style_tk_text_readonly,
+)
 from src.ui.step5_llm_response_view import apply_step5_response_to_tk_text, build_step5_llm_response_html
 from src.ui.pipeline_summary import PipelineSummaryPane, StepPipelineMetric
 
@@ -191,6 +207,20 @@ _STEP5_OPENROUTER_MODEL_CHOICES: tuple[str, ...] = (
     "openai/gpt-4o-mini",
     "openai/gpt-4o",
 )
+
+
+def _session_delete_confirmation_text(session_id: str) -> str:
+    """Multi-line warning for session delete: same steps as the progress dialog (session_cleanup)."""
+    sid_short = session_id[:8] + "…" if len(session_id) > 12 else session_id
+    bullets = "\n".join(f"• {lab}" for lab in SESSION_DELETE_STEP_LABELS)
+    return (
+        "Deleting this session cannot be undone.\n\n"
+        "The following will be removed (each step is shown in the progress window):\n\n"
+        f"{bullets}\n\n"
+        "Remote OpenAI cleanup is attempted but may not complete if the network or API fails.\n\n"
+        f"Session: {sid_short}\n\n"
+        "Delete this session now?"
+    )
 
 
 class QuestionRefinerTab:
@@ -235,6 +265,8 @@ class QuestionRefinerTab:
                 tuple[tuple[int, int, str], ...],
             ],
         ] = {}
+        # Full Step 3 table rows for client-side search (values tuple + treeview tags)
+        self._fv_pipeline_row_cache: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
         self._step5_orchestrator: Step5Orchestrator | None = None
         self._step5_poll_after_id: str | None = None
         self._step5_live_refresh_after_id: str | None = None
@@ -300,7 +332,7 @@ class QuestionRefinerTab:
             justify="left",
         ).pack(anchor="w", pady=(4, 0))
 
-        self._sub_notebook = ttk.Notebook(scroll_inner)
+        self._sub_notebook = ttk.Notebook(scroll_inner, style="Pipeline.TNotebook")
         self._sub_notebook.pack(fill=BOTH, expand=True)
 
         tab_refiner = ttk.Frame(self._sub_notebook)
@@ -341,13 +373,22 @@ class QuestionRefinerTab:
         self._pack_question_refiner_header(tab_refiner)
 
         paned = ttk.PanedWindow(tab_refiner, orient=tk.HORIZONTAL)
-        paned.pack(fill=BOTH, expand=True, padx=(8, 8), pady=(0, 8))
+        paned.pack(fill=BOTH, expand=True, padx=(12, 12), pady=(0, 10))
 
-        left = ttk.Frame(paned, style="Card.TFrame", width=240, padding=(12, 12))
-        paned.add(left, weight=0)
+        left_wrap = tk.Frame(paned, bg=MaterialColors.surface, highlightthickness=0)
+        left_card = tk.Frame(
+            left_wrap,
+            bg=MaterialColors.surface_container,
+            highlightthickness=1,
+            highlightbackground=MaterialColors.chat_shell_border,
+        )
+        left_card.pack(fill=BOTH, expand=True)
+        left = ttk.Frame(left_card, style="Card.TFrame", width=240, padding=(14, 14))
+        left.pack(fill=BOTH, expand=True)
+        paned.add(left_wrap, weight=0)
 
         sess_hdr = ttk.Frame(left, style="Card.TFrame")
-        sess_hdr.pack(anchor="w", fill="x", pady=(0, 6))
+        sess_hdr.pack(anchor="w", fill="x", pady=(0, 8))
         ic = self._icons.get("chat")
         if ic:
             ttk.Label(sess_hdr, image=ic, style="SectionHeading.TLabel").pack(
@@ -356,35 +397,13 @@ class QuestionRefinerTab:
         ttk.Label(sess_hdr, text="Your sessions", style="SectionHeading.TLabel").pack(
             side="left"
         )
-        ttk.Label(
-            left,
-            text="Pick a thread or start a new one. Each session keeps its own refined question and pipeline data.",
-            style="Hint.TLabel",
-            wraplength=220,
-            justify="left",
-        ).pack(anchor="w", pady=(0, 8))
-
-        list_fr = ttk.Frame(left, style="Card.TFrame")
-        list_fr.pack(fill=BOTH, expand=True)
-        self._session_list = tk.Listbox(
-            list_fr,
-            width=26,
-            height=10,
-            font=(latin_font, 10),
-            selectmode=tk.SINGLE,
-            activestyle="none",
-        )
-        style_tk_listbox(self._session_list, latin_family=latin_font, size=10)
-        sb_l = ttk.Scrollbar(list_fr, orient=VERTICAL, command=self._session_list.yview)
-        self._session_list.configure(yscrollcommand=sb_l.set)
-        self._session_list.pack(side=LEFT, fill=BOTH, expand=True)
-        sb_l.pack(side=RIGHT, fill="y")
 
         btns = ttk.Frame(left, style="Card.TFrame")
-        btns.pack(fill="x", pady=(12, 0))
+        btns.pack(fill="x", pady=(0, 8))
         a_i, e_i, d_i = self._icons.get("add"), self._icons.get("edit"), self._icons.get("delete")
 
         def _mb(**kw: Any) -> ttk.Button:
+            kw.setdefault("style", "SessionTool.TButton")
             return ttk.Button(btns, **kw)
 
         nk: dict = {"text": "New", "command": self._new_session}
@@ -403,9 +422,38 @@ class QuestionRefinerTab:
             dk["compound"] = "left"
         _mb(**dk).pack(fill="x")
 
+        ttk.Label(
+            left,
+            text="Pick a thread or start a new one. Each session keeps its own refined question and pipeline data.",
+            style="Hint.TLabel",
+            wraplength=220,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        list_fr = tk.Frame(
+            left,
+            bg=MaterialColors.composer_trough,
+            highlightthickness=1,
+            highlightbackground=MaterialColors.chat_shell_border,
+        )
+        list_fr.pack(fill=BOTH, expand=True)
+        self._session_list = tk.Listbox(
+            list_fr,
+            width=26,
+            height=10,
+            font=(latin_font, 10),
+            selectmode=tk.SINGLE,
+            activestyle="none",
+        )
+        style_tk_listbox(self._session_list, latin_family=latin_font, size=10)
+        sb_l = ttk.Scrollbar(list_fr, orient=VERTICAL, command=self._session_list.yview)
+        self._session_list.configure(yscrollcommand=sb_l.set)
+        self._session_list.pack(side=LEFT, fill=BOTH, expand=True)
+        sb_l.pack(side=RIGHT, fill="y")
+
         self._session_list.bind("<<ListboxSelect>>", self._on_list_select)
 
-        center = ttk.Frame(paned, style="Card.TFrame", padding=(14, 12))
+        center = ttk.Frame(paned, style="Card.TFrame", padding=(18, 14))
         paned.add(center, weight=1)
 
         has_key = bool((os.environ.get("OPENAI_API_KEY") or "").strip())
@@ -413,7 +461,7 @@ class QuestionRefinerTab:
             center,
             wraplength=640,
             justify="left",
-            style="Hint.TLabel",
+            style="ChatIntro.TLabel",
             text=(
                 "Chat with the refiner: say what you are exploring in your own words. "
                 "It helps you converge on one clear question, then you move to tab 1."
@@ -434,21 +482,21 @@ class QuestionRefinerTab:
 
         _log_row = _intro_rows
         log_fr = ttk.Frame(center, style="Card.TFrame")
-        log_fr.grid(row=_log_row, column=0, sticky="new", pady=(0, 8))
-        ttk.Label(log_fr, text="Messages", style="SectionHeading.TLabel").pack(
-            anchor="w", pady=(0, 6)
+        log_fr.grid(row=_log_row, column=0, sticky="new", pady=(0, 10))
+        ttk.Label(log_fr, text="Messages", style="ChatSection.TLabel").pack(
+            anchor="w", pady=(0, 8)
         )
         self._refine_chat_shell = tk.Frame(
             log_fr,
             height=340,
             highlightthickness=1,
-            highlightbackground=MaterialColors.outline,
-            bg=MaterialColors.surface_container,
+            highlightbackground=MaterialColors.chat_shell_border,
+            bg=MaterialColors.composer_trough,
         )
         self._refine_chat_shell.pack(fill=tk.X, expand=False)
         self._refine_chat_shell.pack_propagate(False)
         log_row = tk.Frame(self._refine_chat_shell, bg=MaterialColors.surface_container)
-        log_row.pack(fill=BOTH, expand=True, padx=1, pady=1)
+        log_row.pack(fill=BOTH, expand=True, padx=3, pady=3)
         self._log = tk.Text(
             log_row,
             wrap="word",
@@ -456,7 +504,9 @@ class QuestionRefinerTab:
             font=(arabic_font, 11),
             relief="flat",
         )
-        style_tk_text_readonly(self._log, family=arabic_font, size=11)
+        style_tk_text_readonly(
+            self._log, family=arabic_font, size=11, soft_border=True
+        )
         vsb = ttk.Scrollbar(log_row, orient=VERTICAL, command=self._log.yview)
         self._log.configure(yscrollcommand=vsb.set)
         self._log.pack(side=LEFT, fill=BOTH, expand=True)
@@ -481,28 +531,38 @@ class QuestionRefinerTab:
 
         _inp_row = _log_row + 1
         inp_fr = ttk.Frame(center, style="Card.TFrame")
-        inp_fr.grid(row=_inp_row, column=0, sticky="ew", pady=(0, 4))
-        inp_row = ttk.Frame(inp_fr, style="Card.TFrame")
-        inp_row.pack(fill=tk.X, expand=False)
+        inp_fr.grid(row=_inp_row, column=0, sticky="ew", pady=(0, 6))
+        composer = tk.Frame(
+            inp_fr,
+            bg=MaterialColors.composer_trough,
+            highlightthickness=1,
+            highlightbackground=MaterialColors.chat_shell_border,
+        )
+        composer.pack(fill=tk.X, expand=False)
+        inp_row = tk.Frame(composer, bg=MaterialColors.composer_trough)
+        inp_row.pack(fill=tk.X, padx=4, pady=4)
         self._input = ScrolledText(
             inp_row,
             height=3,
             width=40,
             wrap="word",
             relief="flat",
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self._input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self._input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
         for child in self._input.winfo_children():
             if isinstance(child, tk.Text):
-                style_tk_text_input(child, family=arabic_font, size=11)
+                style_tk_text_composer_input(child, family=arabic_font, size=11)
                 child.configure(font=(arabic_font, 11))
+        self._input.configure(bg=MaterialColors.composer_trough)
         s_img = self._icons.get("send")
         sk: dict = {"text": "Send", "command": self._send, "style": "Accent.TButton"}
         if s_img:
             sk["image"] = s_img
             sk["compound"] = "left"
         self._send_btn = ttk.Button(inp_row, **sk)
-        self._send_btn.pack(side=tk.RIGHT, anchor="ne")
+        self._send_btn.pack(side=tk.RIGHT, anchor="se", padx=(0, 2), pady=(0, 2))
 
         _stat_row = _inp_row + 1
         self._status = tk.StringVar(value="Ready." if has_key else "API key missing.")
@@ -672,14 +732,20 @@ class QuestionRefinerTab:
 
     def _pack_question_refiner_header(self, tab: ttk.Frame) -> None:
         """Hero strip + session context for the Question refiner tab only."""
-        hero = ttk.Frame(tab, style="Hero.TFrame", padding=(12, 10))
-        hero.pack(fill="x", padx=0, pady=(0, 4))
+        outer = tk.Frame(tab, bg=MaterialColors.surface, highlightthickness=0)
+        outer.pack(fill="x", padx=12, pady=(10, 6))
+        hero_bar = tk.Frame(outer, bg=MaterialColors.primary_container, highlightthickness=0)
+        hero_bar.pack(fill="x")
+        accent = tk.Frame(hero_bar, bg=MaterialColors.primary, width=5)
+        accent.pack(side=LEFT, fill="y")
+        hero = ttk.Frame(hero_bar, style="Hero.TFrame", padding=(16, 14))
+        hero.pack(side=LEFT, fill=BOTH, expand=True)
         ttk.Label(hero, text="Refine your question", style="HeroTitle.TLabel").pack(anchor="w")
         ttk.Label(
             hero,
             textvariable=self._session_step_banner_var,
             style="HeroMeta.TLabel",
-        ).pack(anchor="w", pady=(8, 0))
+        ).pack(anchor="w", pady=(10, 0))
         rq = ttk.Label(
             hero,
             textvariable=self._refined_question_banner_var,
@@ -687,7 +753,7 @@ class QuestionRefinerTab:
             wraplength=920,
             justify="left",
         )
-        rq.pack(anchor="w", pady=(6, 0))
+        rq.pack(anchor="w", pady=(8, 0))
         rq.configure(font=(self._arabic, 11))
 
     def _toggle_qr_advanced_panel(self) -> None:
@@ -1411,10 +1477,11 @@ class QuestionRefinerTab:
             font=(lf, 10),
             text=(
                 "Local scan of quran_tokens (no OpenAI). "
-                "Uses the latest Bot 1 run for this session. For each connotation, searches the "
-                "exact contiguous token sequence (match-normalized Arabic, including ة/ه) for "
-                "the connotation text and for synonyms from the latest Bot 2 run per connotation. "
-                "Re-running replaces all saved matches for this session.\n\n"
+                "Uses the latest Bot 1 run for this session. For each connotation, searches "
+                "match-normalized Arabic (including ة/ه): multi-word phrases must match as an exact "
+                "contiguous token sequence; a single-word query (3+ letters) also matches a longer "
+                "corpus token that contains it (e.g. نفس matches الانفس in 39:42). Synonyms use the "
+                "same rules. Re-running replaces all saved matches for this session.\n\n"
                 "Important: you need the full Quran in quran_tokens — not just words.example.json "
                 "(four words of al-Fātihah 1:1). Import a complete word-by-word JSON "
                 "(see README → Import Quran words)."
@@ -1573,6 +1640,37 @@ class QuestionRefinerTab:
         ttk.Label(fv_table_section, textvariable=self._fv_not_found_hint, font=(lf, 8), wraplength=720).pack(
             anchor="w", pady=(0, 4)
         )
+        fv_search_row = ttk.Frame(fv_table_section)
+        fv_search_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(fv_search_row, text="Search table:", font=(lf, 9)).pack(side=LEFT)
+        self._fv_table_search_var = tk.StringVar(value="")
+        self._fv_table_search_var.trace_add(
+            "write",
+            lambda *_a: self._apply_fv_pipeline_table_filter(),
+        )
+        self._fv_table_search_entry = ttk.Entry(
+            fv_search_row,
+            textvariable=self._fv_table_search_var,
+            width=48,
+        )
+        self._fv_table_search_entry.pack(side=LEFT, padx=(8, 8), fill="x", expand=True)
+        ttk.Button(
+            fv_search_row,
+            text="Clear",
+            command=self._clear_fv_table_search,
+            width=8,
+        ).pack(side=LEFT)
+        ttk.Label(
+            fv_table_section,
+            text=(
+                "Matches any column by substring, or use surah:ayah (e.g. 6:40) to show only that verse’s "
+                "hit row(s)."
+            ),
+            font=(lf, 8),
+            foreground=MaterialColors.on_surface_variant,
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 4))
         nf_tr = ttk.Frame(fv_table_section)
         nf_tr.pack(fill=BOTH, expand=True)
         nf_tr.rowconfigure(0, weight=1)
@@ -1598,10 +1696,11 @@ class QuestionRefinerTab:
             height=10,
             selectmode="browse",
         )
-        self._fv_pipeline_tree.tag_configure("fv_hit_even", background="#e8f5e9")
-        self._fv_pipeline_tree.tag_configure("fv_hit_odd", background="#f1f8e9")
-        self._fv_pipeline_tree.tag_configure("nf_even", background="#ffffff")
-        self._fv_pipeline_tree.tag_configure("nf_odd", background="#eef2f7")
+        C = MaterialColors
+        self._fv_pipeline_tree.tag_configure("fv_hit_even", background=C.tree_hit_a)
+        self._fv_pipeline_tree.tag_configure("fv_hit_odd", background=C.tree_hit_b)
+        self._fv_pipeline_tree.tag_configure("nf_even", background=C.tree_zebra_a)
+        self._fv_pipeline_tree.tag_configure("nf_odd", background=C.tree_zebra_b)
         self._fv_pipeline_tree.heading("row_no", text="#")
         self._fv_pipeline_tree.heading("result", text="Result")
         self._fv_pipeline_tree.heading("match_type", text="Type")
@@ -1687,8 +1786,8 @@ class QuestionRefinerTab:
             height=10,
             selectmode="browse",
         )
-        self._step4_pipeline_tree.tag_configure("s4_even", background="#f5f5f5")
-        self._step4_pipeline_tree.tag_configure("s4_odd", background="#ffffff")
+        self._step4_pipeline_tree.tag_configure("s4_even", background=MaterialColors.tree_zebra_a)
+        self._step4_pipeline_tree.tag_configure("s4_odd", background=MaterialColors.tree_zebra_b)
         self._step4_pipeline_tree.heading("row_no", text="#")
         self._step4_pipeline_tree.heading("topic", text="Topic")
         self._step4_pipeline_tree.heading("connotation", text="Connotation")
@@ -3961,7 +4060,7 @@ class QuestionRefinerTab:
             ).pack(anchor="w", pady=6)
             return
 
-        fig = Figure(figsize=(9.2, 3.45), dpi=100, facecolor="#f4f6f8")
+        fig = Figure(figsize=(9.2, 3.45), dpi=100, facecolor=MaterialColors.surface)
         ax_pie, ax_bar = fig.subplots(1, 2)
 
         labels: list[str] = []
@@ -4016,6 +4115,7 @@ class QuestionRefinerTab:
             ax_bar.axis("off")
 
         fig.tight_layout()
+        style_mpl_figure(fig)
         canvas = FigureCanvasTkAgg(fig, master=holder)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=BOTH, expand=True)
@@ -4767,7 +4867,7 @@ class QuestionRefinerTab:
             return
 
         h_in = max(2.8, min(14.0, 0.38 * n + 1.4))
-        fig = Figure(figsize=(8.2, h_in), dpi=100, facecolor="#f4f6f8")
+        fig = Figure(figsize=(8.2, h_in), dpi=100, facecolor=MaterialColors.surface)
         ax = fig.subplots()
         y = list(range(n))
         w_con = [r.n_connotation_hits for r in stats.bar_rows]
@@ -4782,6 +4882,7 @@ class QuestionRefinerTab:
         ax.set_xlim(0, xmax)
         ax.grid(axis="x", linestyle=":", alpha=0.5)
         fig.tight_layout()
+        style_mpl_figure(fig)
         canvas = FigureCanvasTkAgg(fig, master=self._fv_chart_holder)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=BOTH, expand=True)
@@ -4805,6 +4906,8 @@ class QuestionRefinerTab:
             self._find_verses_status.set("")
             self._find_verses_preview.configure(state="disabled")
             self._clear_fv_pipeline_tree()
+            if hasattr(self, "_fv_table_search_var"):
+                self._fv_table_search_var.set("")
             if hasattr(self, "_fv_not_found_hint"):
                 self._fv_not_found_hint.set("")
             self._refresh_fv_scorecard_and_chart(None)
@@ -4925,6 +5028,40 @@ class QuestionRefinerTab:
             return
         for iid in self._fv_pipeline_tree.get_children():
             self._fv_pipeline_tree.delete(iid)
+        self._fv_pipeline_row_cache = []
+
+    def _clear_fv_table_search(self) -> None:
+        if hasattr(self, "_fv_table_search_var"):
+            self._fv_table_search_var.set("")
+
+    def _apply_fv_pipeline_table_filter(self) -> None:
+        if not hasattr(self, "_fv_pipeline_tree"):
+            return
+        for iid in self._fv_pipeline_tree.get_children():
+            self._fv_pipeline_tree.delete(iid)
+        cache = self._fv_pipeline_row_cache
+        q = ""
+        if hasattr(self, "_fv_table_search_var"):
+            q = (self._fv_table_search_var.get() or "").strip()
+        verse = _parse_fv_table_surah_ayah(q) if q else None
+        row_num = 1
+        for vals, tag_tuple in cache:
+            if q:
+                if verse is not None:
+                    su, ay = verse
+                    want = f"{su}:{ay}"
+                    vref = vals[5] if len(vals) > 5 else ""
+                    if (vref or "").strip() != want:
+                        continue
+                else:
+                    hay = " ".join(str(v) for v in vals).casefold()
+                    if q.casefold() not in hay:
+                        continue
+            out = (str(row_num),) + vals[1:]
+            self._fv_pipeline_tree.insert("", END, values=out, tags=tag_tuple)
+            row_num += 1
+        if hasattr(self, "_qr_sync_scrollregion"):
+            self._root.after_idle(self._qr_sync_scrollregion)
 
     def _refill_fv_pipeline_tree(
         self,
@@ -4935,7 +5072,7 @@ class QuestionRefinerTab:
     ) -> None:
         if not hasattr(self, "_fv_pipeline_tree") or not hasattr(self, "_fv_not_found_hint"):
             return
-        self._clear_fv_pipeline_tree()
+        cache: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
         hit_i = 0
         row_num = 1
         if not db_load_err:
@@ -4950,11 +5087,11 @@ class QuestionRefinerTab:
                 q = str(r["query_text"]).replace("\n", " ").strip()
                 atext = (ayah_texts.get((su, ay)) or "").replace("\n", " ")
                 tag = "fv_hit_odd" if hit_i % 2 else "fv_hit_even"
-                self._fv_pipeline_tree.insert(
-                    "",
-                    END,
-                    values=(str(row_num), "Found", mt, cid, tid, verse_ref, q, atext),
-                    tags=(tag,),
+                cache.append(
+                    (
+                        (str(row_num), "Found", mt, cid, tid, verse_ref, q, atext),
+                        (tag,),
+                    )
                 )
                 hit_i += 1
                 row_num += 1
@@ -4988,26 +5125,26 @@ class QuestionRefinerTab:
             miss_i = 0
             for cid, txt in sorted(nfc, key=lambda t: (t[0], t[1])):
                 tag = "nf_odd" if miss_i % 2 else "nf_even"
-                self._fv_pipeline_tree.insert(
-                    "",
-                    END,
-                    values=(str(row_num), "No match", "connotation", str(cid), "", "", txt, ""),
-                    tags=(tag,),
+                cache.append(
+                    (
+                        (str(row_num), "No match", "connotation", str(cid), "", "", txt, ""),
+                        (tag,),
+                    )
                 )
                 miss_i += 1
                 row_num += 1
             for cid, tid, txt in sorted(nfs, key=lambda t: (t[0], t[1], t[2])):
                 tag = "nf_odd" if miss_i % 2 else "nf_even"
-                self._fv_pipeline_tree.insert(
-                    "",
-                    END,
-                    values=(str(row_num), "No match", "synonym", str(cid), str(tid), "", txt, ""),
-                    tags=(tag,),
+                cache.append(
+                    (
+                        (str(row_num), "No match", "synonym", str(cid), str(tid), "", txt, ""),
+                        (tag,),
+                    )
                 )
                 miss_i += 1
                 row_num += 1
-        if hasattr(self, "_qr_sync_scrollregion"):
-            self._root.after_idle(self._qr_sync_scrollregion)
+        self._fv_pipeline_row_cache = cache
+        self._apply_fv_pipeline_table_filter()
 
     def _run_find_verses(self) -> None:
         if self._busy:
@@ -5728,23 +5865,43 @@ class QuestionRefinerTab:
             return
         if not messagebox.askyesno(
             "Delete session",
-            "Delete this session and its messages?",
+            _session_delete_confirmation_text(self._current_id),
             parent=self._root,
         ):
             return
         dead = self._current_id
-        self._store.delete_session(dead)
         if dead:
+            dlg: SessionDeleteProgressDialog | None = None
+            err: Exception | None = None
             try:
-                conn = connect(get_db_path())
-                try:
-                    cleanup_openai_session_resources_before_db_delete(conn, dead)
-                    delete_chat_session_pipeline(conn, dead)
-                    delete_messages_for_session(conn, dead)
-                finally:
-                    conn.close()
-            except (OSError, sqlite3.Error):
-                pass
+                dlg = SessionDeleteProgressDialog(
+                    self._root,
+                    step_labels=SESSION_DELETE_STEP_LABELS,
+                    latin_font=self._latin,
+                )
+
+                def _on_step(i: int, total: int, label: str, phase: str) -> None:
+                    if dlg is not None:
+                        dlg.notify_step(i, total, label, phase)
+
+                run_session_deletion_desktop(self._store, dead, _on_step)
+                if dlg is not None:
+                    dlg.set_complete()
+            except Exception as e:
+                err = e
+            finally:
+                if dlg is not None:
+                    try:
+                        dlg.destroy()
+                    except tk.TclError:
+                        pass
+            if err is not None:
+                messagebox.showerror(
+                    "Delete session",
+                    f"Deletion could not finish:\n{err}",
+                    parent=self._root,
+                )
+                return
             self._session_totals.pop(dead, None)
             self._last_result_by_session.pop(dead, None)
             self._last_bot1_error_by_session.pop(dead, None)

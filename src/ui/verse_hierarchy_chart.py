@@ -14,6 +14,7 @@ from matplotlib.colors import to_rgba
 from src.db.verse_hierarchy import VerseWordNode
 from src.ui.arabic_display import configure_matplotlib_arabic_font, shape_arabic_display
 from src.ui.lexicon_display import heading_display_label
+from src.ui.material_theme import MaterialColors
 
 _ARABIC_FONT_FAMILY = configure_matplotlib_arabic_font()
 
@@ -402,6 +403,7 @@ def draw_verse_chart(
     Returns node order and Text artists for hit-testing.
     """
     ax.clear()
+    ax.set_facecolor(MaterialColors.surface)
     ax.set_aspect("auto")
     ax.axis("off")
 
@@ -530,8 +532,9 @@ class VerseHierarchyChart:
         self._short_labels: dict[str, str] = {}
         self._leaf_full_text: dict[str, str] = {}
 
-        self.figure = Figure(figsize=(12, 8), dpi=100, facecolor="#f4f6f7")
+        self.figure = Figure(figsize=(12, 8), dpi=100, facecolor=MaterialColors.surface)
         self.ax = self.figure.add_subplot(111)
+        self.ax.set_facecolor(MaterialColors.surface)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
@@ -543,6 +546,8 @@ class VerseHierarchyChart:
 
     def clear(self) -> None:
         self.ax.clear()
+        self.ax.set_facecolor(MaterialColors.surface)
+        self.figure.patch.set_facecolor(MaterialColors.surface)
         self.ax.axis("off")
         self.ax.text(
             0.5,
@@ -552,7 +557,7 @@ class VerseHierarchyChart:
             va="center",
             transform=self.ax.transAxes,
             fontsize=11,
-            color="#566573",
+            color=MaterialColors.on_surface_variant,
         )
         self._nodelist = []
         self._full_labels = {}

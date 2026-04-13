@@ -336,6 +336,18 @@ CREATE TABLE IF NOT EXISTS step6_report_runs (
 CREATE INDEX IF NOT EXISTS idx_step6_report_session ON step6_report_runs(chat_session_id);
 """
 
+_MIGRATE_STEP6_REPORT_CHAT = """
+CREATE TABLE IF NOT EXISTS step6_report_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    meta_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_step6_report_chat_session ON step6_report_chat_messages(chat_session_id);
+"""
+
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -360,6 +372,12 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_MIGRATE_STEP5_SHORTLIST)
     conn.executescript(_MIGRATE_STEP5_STATS_SNAPSHOT)
     conn.executescript(_MIGRATE_STEP6)
+    conn.executescript(_MIGRATE_STEP6_REPORT_CHAT)
+    cols_step6r = _table_columns(conn, "step6_report_runs")
+    if cols_step6r and "openai_report_file_id" not in cols_step6r:
+        conn.execute(
+            "ALTER TABLE step6_report_runs ADD COLUMN openai_report_file_id TEXT"
+        )
     cols_chat = _table_columns(conn, "chat_sessions")
     if cols_chat and "openai_vector_store_id" not in cols_chat:
         conn.execute(
