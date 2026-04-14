@@ -435,6 +435,17 @@ CREATE TABLE IF NOT EXISTS step6_knowledge_files (
 );
 CREATE INDEX IF NOT EXISTS idx_step6_knowledge_session ON step6_knowledge_files(chat_session_id);
 
+CREATE TABLE IF NOT EXISTS session_attached_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    openai_file_id TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_session_attached_session ON session_attached_documents(chat_session_id);
+
 CREATE TABLE IF NOT EXISTS step6_report_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,

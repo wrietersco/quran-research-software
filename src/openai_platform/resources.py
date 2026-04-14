@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
 
 class OpenAIAdminError(Exception):
@@ -84,19 +84,31 @@ def delete_file(file_id: str) -> None:
     client.files.delete(file_id)
 
 
-def list_vector_store_files(vector_store_id: str, *, limit: int = 50) -> list[dict]:
+def list_vector_store_files(vector_store_id: str, *, limit: int = 100) -> list[dict]:
     client = make_openai_client()
+    collected: list = []
     page = client.vector_stores.files.list(vector_store_id, limit=min(limit, 100))
+    collected.extend(page.data or [])
+    while getattr(page, "has_next_page", lambda: False)():
+        page = page.get_next_page()
+        collected.extend(page.data or [])
+
     out: list[dict] = []
-    for vf in page.data or []:
-        out.append(
-            {
-                "id": vf.id,
-                "vector_store_id": vector_store_id,
-                "status": getattr(vf, "status", None),
-                "usage_bytes": getattr(vf, "usage_bytes", None),
-            }
-        )
+    for vf in collected:
+        fid = str(vf.id)
+        row = {
+            "id": fid,
+            "vector_store_id": vector_store_id,
+            "status": getattr(vf, "status", None),
+            "usage_bytes": getattr(vf, "usage_bytes", None),
+            "filename": None,
+        }
+        try:
+            fobj = client.files.retrieve(fid)
+            row["filename"] = getattr(fobj, "filename", None)
+        except OpenAIError:
+            row["filename"] = None
+        out.append(row)
     return out
 
 
@@ -113,3 +125,17 @@ def attach_file_to_vector_store(vector_store_id: str, file_id: str) -> dict:
 def delete_vector_store_file(vector_store_id: str, file_id: str) -> None:
     client = make_openai_client()
     client.vector_stores.files.delete(vector_store_id=vector_store_id, file_id=file_id)
+
+
+def retrieve_vector_store_file(vector_store_id: str, file_id: str) -> dict:
+    """Status of a file attached to a vector store (e.g. ``completed``, ``in_progress``, ``failed``)."""
+    client = make_openai_client()
+    vf = client.vector_stores.files.retrieve(
+        vector_store_id=vector_store_id,
+        file_id=file_id,
+    )
+    return {
+        "id": getattr(vf, "id", None) or file_id,
+        "status": getattr(vf, "status", None),
+        "vector_store_id": vector_store_id,
+    }

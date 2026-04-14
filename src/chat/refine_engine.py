@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.chat.bot1_engine import model_allows_temperature
+from src.chat.openai_responses_util import response_output_text, response_usage_tokens
 from src.config import PROJECT_ROOT
 
 _DOCS_PROMPT = PROJECT_ROOT / "docs" / "chatbot-question-refiner.md"
@@ -152,10 +155,14 @@ def refine_reply(
     api_key: str | None = None,
     model: str | None = None,
     instructions_base: str | None = None,
+    vector_store_ids: list[str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> RefineResult:
     """
     messages: OpenAI-style list of {"role": "user"|"assistant", "content": "..."}.
     Optional ``instructions_base`` overrides disk/doc for the system message (same as desktop editor).
+    When ``vector_store_ids`` is non-empty, uses the Responses API with ``file_search``
+    (same session store as Bot 1 / Step 6); otherwise Chat Completions.
     """
     key = api_key or os.environ.get("OPENAI_API_KEY")
     if not key or not key.strip():
@@ -175,6 +182,59 @@ def refine_reply(
 
     base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
     client = OpenAI(api_key=key, base_url=base_url) if base_url else OpenAI(api_key=key)
+
+    vs_ids = [x.strip() for x in (vector_store_ids or []) if x and str(x).strip()]
+
+    if vs_ids:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RefineError("Question refiner stopped before request.")
+        input_list: list[dict[str, str]] = []
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                input_list.append({"role": str(role), "content": content})
+        if not input_list:
+            raise RefineError("No user or assistant messages to send.")
+
+        tools: list = [{"type": "file_search", "vector_store_ids": vs_ids}]
+        create_kwargs: dict = {
+            "model": model_name,
+            "instructions": system,
+            "input": input_list,
+            "tools": tools,
+            "include": ["file_search_call.results"],
+        }
+        if model_allows_temperature(model_name):
+            create_kwargs["temperature"] = REFINE_TEMPERATURE
+
+        try:
+            resp = client.responses.create(**create_kwargs)
+        except Exception as e:
+            raise RefineError(
+                "OpenAI Responses API request failed (session documents / file_search). "
+                f"Ensure your key and proxy support the Responses API. Details: {e}"
+            ) from e
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise RefineError("Question refiner stopped after response.")
+
+        text = response_output_text(resp)
+        if not text:
+            raise RefineError("Empty response from the model (Responses API).")
+        pt, ct, tt = response_usage_tokens(resp)
+        if tt is None and pt is not None and ct is not None:
+            tt = int(pt) + int(ct)
+        return RefineResult(
+            text=text,
+            model=getattr(resp, "model", None) or model_name,
+            response_id=getattr(resp, "id", None),
+            finish_reason=getattr(resp, "status", None),
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+        )
+
     chat_messages = [{"role": "system", "content": system}]
     for m in messages:
         role = m.get("role")

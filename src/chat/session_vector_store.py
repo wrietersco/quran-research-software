@@ -13,6 +13,7 @@ from src.db.chat_pipeline import (
     upsert_chat_session,
 )
 from src.db.connection import connect
+from src.db.session_attached_documents import list_openai_file_ids_for_session_attached
 from src.db.step6_report import list_openai_report_file_ids_for_session
 from src.openai_platform.resources import (
     OpenAIAdminError,
@@ -34,6 +35,11 @@ def session_knowledge_dir(chat_session_id: str) -> Path:
 
 def session_reports_dir(chat_session_id: str) -> Path:
     return session_data_root(chat_session_id) / "reports"
+
+
+def session_uploads_dir(chat_session_id: str) -> Path:
+    """User-attached documents for Refine / pipeline (copied locally, indexed on OpenAI)."""
+    return session_data_root(chat_session_id) / "uploads"
 
 
 def delete_session_local_data_directory(chat_session_id: str) -> None:
@@ -139,7 +145,8 @@ def cleanup_openai_session_resources_before_db_delete(
     ).fetchall()
     kf = [str(r["openai_file_id"]) for r in rows if r["openai_file_id"]]
     rf = list_openai_report_file_ids_for_session(conn, chat_session_id)
-    fids = list(dict.fromkeys(kf + rf))
+    uf = list_openai_file_ids_for_session_attached(conn, chat_session_id)
+    fids = list(dict.fromkeys(kf + rf + uf))
     detach_and_delete_openai_knowledge_files(vid, fids)
     try:
         delete_vector_store(vid)

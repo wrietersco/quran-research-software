@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Any
 
 import tkinter as tk
-from tkinter import BOTH, END, messagebox, filedialog, ttk, scrolledtext
+from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, messagebox, filedialog, ttk, scrolledtext
+from tkinter.scrolledtext import ScrolledText
+
+from src.ui.material_theme import (
+    MaterialColors,
+    style_tk_listbox,
+    style_tk_text_composer_input,
+    style_tk_text_readonly,
+)
 
 from src.chat.session_vector_store import (
     create_session_vector_store_async,
@@ -286,61 +294,220 @@ class Step6ReportPane:
         )
 
     def _build_discuss_tab(self, tab: ttk.Frame) -> None:
-        lf = self._lf()
-        hdr = ttk.Label(
-            tab,
-            text="Discuss — report assistant (PARI)",
-            font=(lf[0], 12, "bold"),
-        )
-        hdr.pack(anchor="w", padx=6, pady=(6, 4))
+        host = self._host
+        latin = getattr(host, "_latin", "Segoe UI")
+        arabic = getattr(host, "_arabic", "Segoe UI")
+
+        root = getattr(host, "_root", None)
+        outer_pad = ttk.Frame(tab, style="Card.TFrame", padding=(12, 10))
+        outer_pad.pack(fill=BOTH, expand=True)
+
         ttk.Label(
-            tab,
+            outer_pad,
+            text="Discuss — report assistant (PARI)",
+            style="SectionHeading.TLabel",
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            outer_pad,
             text=(
                 "Chat answers are short and conversational (not mini-reports). "
-                "A **new PARI report** runs only when you clearly ask for one (e.g. write a new report, "
-                "rewrite the report, run PARI again)."
+                "A new PARI report runs only when you clearly ask for one "
+                "(e.g. write a new report, rewrite the report, run PARI again)."
             ),
             wraplength=720,
             justify=tk.LEFT,
-        ).pack(anchor="w", padx=6, pady=(0, 4))
+            style="ChatIntro.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
 
-        outer = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
-        outer.pack(fill=BOTH, expand=True, padx=6, pady=6)
+        outer = ttk.PanedWindow(outer_pad, orient=tk.HORIZONTAL)
+        outer.pack(fill=BOTH, expand=True)
 
-        left = ttk.Labelframe(outer, text="Report runs")
-        right = ttk.Labelframe(outer, text="Chat")
+        left = ttk.Frame(outer, style="Card.TFrame", padding=(10, 8))
+        right = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
         outer.add(left, weight=0)
         outer.add(right, weight=1)
 
-        self._report_list_ids: list[int] = []
-        self._report_listbox = tk.Listbox(left, height=18, font=("Consolas", 9))
-        sb_l = ttk.Scrollbar(left, command=self._report_listbox.yview)
-        self._report_listbox.configure(yscrollcommand=sb_l.set)
-        self._report_listbox.pack(side=tk.LEFT, fill=BOTH, expand=True, padx=(4, 0), pady=4)
-        sb_l.pack(side=tk.RIGHT, fill=tk.Y, pady=4)
+        ttk.Label(left, text="Report runs", style="ChatSection.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            left,
+            text=(
+                "Actions are above the list so they stay visible. Select a run below, then open a format "
+                "or folder. Double-click a run for a quick preview (scroll the list itself when there are many runs)."
+            ),
+            wraplength=280,
+            justify=tk.LEFT,
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
 
-        br = ttk.Frame(left)
-        br.pack(fill=tk.X, padx=4, pady=(0, 4))
-        ttk.Button(br, text="Open HTML", command=self._discuss_open_html).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(br, text="Open folder", command=self._discuss_open_folder).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(br, text="Refresh list", command=self._refresh_report_runs_list).pack(side=tk.LEFT)
+        br1 = ttk.Frame(left, style="Card.TFrame")
+        br1.pack(fill=tk.X, pady=(0, 4))
+        for txt, cmd in (
+            ("Open HTML", self._discuss_open_html),
+            ("Markdown", self._discuss_open_markdown),
+            ("PDF", self._discuss_open_pdf),
+            ("Word", self._discuss_open_docx),
+        ):
+            ttk.Button(br1, text=txt, command=cmd, width=11).pack(side=tk.LEFT, padx=(0, 4))
 
-        self._discuss_chat = scrolledtext.ScrolledText(
-            right, height=16, wrap=tk.WORD, font=("Segoe UI", 10), state="disabled"
+        br2 = ttk.Frame(left, style="Card.TFrame")
+        br2.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(br2, text="Open folder", command=self._discuss_open_folder, width=12).pack(
+            side=tk.LEFT, padx=(0, 6)
         )
-        self._discuss_chat.pack(fill=BOTH, expand=True, padx=4, pady=4)
+        ttk.Button(br2, text="Refresh list", command=self._refresh_report_runs_list, width=12).pack(
+            side=tk.LEFT
+        )
 
-        inp_fr = ttk.Frame(right)
-        inp_fr.pack(fill=tk.X, padx=4, pady=(0, 6))
-        self._discuss_input = tk.Text(inp_fr, height=4, wrap=tk.WORD, font=("Segoe UI", 10))
+        ttk.Label(left, text="All runs (newest first)", style="ChatSection.TLabel").pack(
+            anchor="w", pady=(0, 4)
+        )
+        list_wrap = tk.Frame(
+            left,
+            bg=MaterialColors.composer_trough,
+            highlightthickness=1,
+            highlightbackground=MaterialColors.chat_shell_border,
+        )
+        list_wrap.pack(fill=BOTH, expand=True)
+        self._report_list_ids: list[int] = []
+        self._report_listbox = tk.Listbox(
+            list_wrap,
+            height=8,
+            width=36,
+            font=(latin, 10),
+            selectmode=tk.SINGLE,
+            activestyle="none",
+        )
+        style_tk_listbox(self._report_listbox, latin_family=latin, size=10)
+        sb_l = ttk.Scrollbar(list_wrap, orient=VERTICAL, command=self._report_listbox.yview)
+        self._report_listbox.configure(yscrollcommand=sb_l.set)
+        self._report_listbox.pack(side=tk.LEFT, fill=BOTH, expand=True)
+        sb_l.pack(side=tk.RIGHT, fill=tk.Y)
+        self._report_listbox.bind("<Double-Button-1>", lambda _e: self._discuss_open_primary_preview())
+
+        ttk.Label(right, text="Messages", style="ChatSection.TLabel").pack(anchor="w", pady=(0, 8))
+        self._discuss_chat_shell = tk.Frame(
+            right,
+            height=300,
+            highlightthickness=1,
+            highlightbackground=MaterialColors.chat_shell_border,
+            bg=MaterialColors.composer_trough,
+        )
+        self._discuss_chat_shell.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self._discuss_chat_shell.pack_propagate(False)
+        log_row = tk.Frame(self._discuss_chat_shell, bg=MaterialColors.surface_container)
+        log_row.pack(fill=BOTH, expand=True, padx=3, pady=3)
+        self._discuss_chat = tk.Text(
+            log_row,
+            wrap="word",
+            state="disabled",
+            font=(arabic, 11),
+            relief="flat",
+        )
+        style_tk_text_readonly(self._discuss_chat, family=arabic, size=11, soft_border=True)
+        vsb = ttk.Scrollbar(log_row, orient=VERTICAL, command=self._discuss_chat.yview)
+        self._discuss_chat.configure(yscrollcommand=vsb.set)
+        self._discuss_chat.pack(side=tk.LEFT, fill=BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._discuss_chat.tag_configure(
+            "h_user",
+            font=(latin, 10, "bold"),
+            foreground=MaterialColors.secondary,
+        )
+        self._discuss_chat.tag_configure(
+            "h_bot",
+            font=(latin, 10, "bold"),
+            foreground=MaterialColors.success,
+        )
+        self._discuss_chat.tag_configure("err", font=(latin, 10), foreground=MaterialColors.error)
+
+        inp_fr = ttk.Frame(right, style="Card.TFrame")
+        inp_fr.pack(fill=tk.X, pady=(0, 6))
+        composer = tk.Frame(
+            inp_fr,
+            bg=MaterialColors.composer_trough,
+            highlightthickness=1,
+            highlightbackground=MaterialColors.chat_shell_border,
+        )
+        composer.pack(fill=tk.X, expand=False)
+        inp_row = tk.Frame(composer, bg=MaterialColors.composer_trough)
+        inp_row.pack(fill=tk.X, padx=4, pady=4)
+        self._discuss_input = ScrolledText(
+            inp_row,
+            height=4,
+            width=40,
+            wrap="word",
+            relief="flat",
+            highlightthickness=0,
+            borderwidth=0,
+        )
         self._discuss_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-        self._discuss_send_btn = ttk.Button(inp_fr, text="Send", command=self._on_discuss_send, width=10)
-        self._discuss_send_btn.pack(side=tk.RIGHT)
+        for child in self._discuss_input.winfo_children():
+            if isinstance(child, tk.Text):
+                style_tk_text_composer_input(child, family=arabic, size=11)
+                child.configure(font=(arabic, 11))
+        self._discuss_input.configure(bg=MaterialColors.composer_trough)
+
+        icons = getattr(host, "_icons", None)
+        s_img = icons.get("send") if icons else None
+        sk: dict[str, Any] = {
+            "text": "Send",
+            "command": self._on_discuss_send,
+            "style": "Accent.TButton",
+        }
+        if s_img:
+            sk["image"] = s_img
+            sk["compound"] = "left"
+        self._discuss_send_btn = ttk.Button(inp_row, **sk)
+        self._discuss_send_btn.pack(side=tk.RIGHT, anchor="se", padx=(0, 2), pady=(0, 2))
+
+        ttk.Label(
+            right,
+            text="Tip: Ctrl+Enter sends. Regenerate phrasing (e.g. “rewrite the report”) switches to Run and starts PARI.",
+            style="Hint.TLabel",
+            wraplength=640,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(4, 0))
+
+        def _discuss_ctrl_ret(_e: tk.Event) -> str:
+            self._on_discuss_send()
+            return "break"
+
+        self._discuss_input.bind("<Control-Return>", _discuss_ctrl_ret)
+        for child in self._discuss_input.winfo_children():
+            if isinstance(child, tk.Text):
+                child.bind("<Control-Return>", _discuss_ctrl_ret)
+
+        if root is not None:
+
+            def _discuss_tab_configure(event: tk.Event) -> None:
+                if event.widget != tab or getattr(event, "height", 0) < 120:
+                    return
+                reserve = 340
+                avail = max(220, int(event.height) - reserve)
+                nh = min(420, max(240, int(avail * 0.48)))
+                try:
+                    if self._discuss_chat_shell.winfo_height() == nh:
+                        return
+                    self._discuss_chat_shell.configure(height=nh)
+                except tk.TclError:
+                    pass
+
+            tab.bind("<Configure>", _discuss_tab_configure, add=True)
 
     def _append_discuss_chat(self, role: str, text: str) -> None:
         w = self._discuss_chat
         w.configure(state="normal")
-        w.insert(END, f"{role.upper()}\n{text}\n\n")
+        if role == "user":
+            w.insert(END, "You\n", ("h_user",))
+            w.insert(END, text + "\n\n")
+        else:
+            w.insert(END, "Assistant\n", ("h_bot",))
+            body = text + "\n\n"
+            if body.lstrip().startswith("(Error)"):
+                w.insert(END, body, ("err",))
+            else:
+                w.insert(END, body)
         w.configure(state="disabled")
         w.see(END)
 
@@ -381,9 +548,15 @@ class Step6ReportPane:
             return
         for r in runs:
             self._report_list_ids.append(r.id)
-            ts = (r.created_at or "")[:19]
-            mpart = (r.model or "")[:28]
-            self._report_listbox.insert(END, f"#{r.id}  {r.status}  {ts}  {mpart}")
+            raw_ts = (r.created_at or "").replace("T", " ")
+            ts = raw_ts[:16] if len(raw_ts) >= 16 else raw_ts
+            model = (r.model or "—").strip() or "—"
+            if len(model) > 26:
+                model = model[:23] + "…"
+            self._report_listbox.insert(
+                END,
+                f"Run {r.id} — {r.status} — {ts} — {model}",
+            )
 
     def _discuss_selected_run_id(self) -> int | None:
         if not hasattr(self, "_report_listbox"):
@@ -413,7 +586,19 @@ class Step6ReportPane:
                 return Path(r.report_dir)
         return None
 
-    def _discuss_open_html(self) -> None:
+    def _open_local_path_default(self, p: Path) -> None:
+        host = self._host
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(p)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(p)], check=False)
+        except OSError as e:
+            messagebox.showerror("Step 6", str(e), parent=host._root)
+
+    def _discuss_open_report_artifact(self, filename: str, missing_label: str) -> None:
         host = self._host
         rid = self._discuss_selected_run_id()
         if rid is None:
@@ -423,11 +608,54 @@ class Step6ReportPane:
         if not base or not base.is_dir():
             messagebox.showinfo("Step 6", "No folder for this run.", parent=host._root)
             return
-        p = base / "report.html"
-        if p.is_file():
-            webbrowser.open(p.as_uri())
+        path = base / filename
+        if not path.is_file():
+            messagebox.showinfo(
+                "Step 6",
+                f"{missing_label} not found for this run ({filename}).",
+                parent=host._root,
+            )
+            return
+        if filename.endswith(".html"):
+            webbrowser.open(path.as_uri())
         else:
-            messagebox.showinfo("Step 6", "report.html not found for this run.", parent=host._root)
+            self._open_local_path_default(path)
+
+    def _discuss_open_html(self) -> None:
+        self._discuss_open_report_artifact("report.html", "HTML report")
+
+    def _discuss_open_markdown(self) -> None:
+        self._discuss_open_report_artifact("report.md", "Markdown report")
+
+    def _discuss_open_pdf(self) -> None:
+        self._discuss_open_report_artifact("report.pdf", "PDF report")
+
+    def _discuss_open_docx(self) -> None:
+        self._discuss_open_report_artifact("report.docx", "Word report")
+
+    def _discuss_open_primary_preview(self) -> None:
+        host = self._host
+        rid = self._discuss_selected_run_id()
+        if rid is None:
+            messagebox.showinfo("Step 6", "Select a report run in the list.", parent=host._root)
+            return
+        base = self._path_for_report_run(rid)
+        if not base or not base.is_dir():
+            messagebox.showinfo("Step 6", "No folder for this run.", parent=host._root)
+            return
+        for name in ("report.html", "report.pdf", "report.md", "report.docx"):
+            p = base / name
+            if p.is_file():
+                if name.endswith(".html"):
+                    webbrowser.open(p.as_uri())
+                else:
+                    self._open_local_path_default(p)
+                return
+        messagebox.showinfo(
+            "Step 6",
+            "No report exports found in this run folder yet.",
+            parent=host._root,
+        )
 
     def _discuss_open_folder(self) -> None:
         host = self._host
@@ -868,6 +1096,9 @@ class Step6ReportPane:
             )
             return
         k_paths = [Path(str(r["local_path"])) for r in rows if r["local_path"]]
+
+        if self._top_nb is not None:
+            self._top_nb.select(0)
 
         host._begin_busy("Step 6 — Writing report…", op="step6")
         host._pipeline_step_start(sid, 6)

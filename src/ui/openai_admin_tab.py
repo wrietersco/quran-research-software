@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tkinter as tk
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, filedialog, messagebox, simpledialog, ttk
+
 from src.chat.bot1_ui_settings import load_bot1_ui_settings, save_bot1_ui_settings
 from src.chat.bot2_ui_settings import load_bot2_ui_settings, save_bot2_ui_settings
+from src.chat.step6_ui_settings import load_step6_ui_settings
+from src.db.chat_pipeline import map_openai_vector_store_id_to_chat_sessions
+from src.db.connection import connect
 from src.openai_platform.resources import (
     OpenAIAdminError,
     attach_file_to_vector_store,
@@ -39,6 +44,7 @@ class OpenAIAdminTab:
         self._vs_ids: list[str] = []
         self._file_ids: list[str] = []
         self._vs_file_ids: list[str] = []
+        self._vs_file_names: list[str | None] = []
         self._bot1_ids: list[str] = []
         self._bot2_ids: list[str] = []
 
@@ -52,13 +58,15 @@ class OpenAIAdminTab:
             ttk.Label(intro_row, image=cl).pack(side="left", padx=(0, 8))
         ttk.Label(
             intro_row,
-            wraplength=860,
+            wraplength=900,
             justify="left",
             font=(latin_font, 10),
             text=(
-                "Manage OpenAI vector stores and uploaded files (same APIs as the platform dashboard). "
-                "Select vector stores for Bot 1 and Bot 2 file_search below; both use the Responses API "
-                "(Question refiner → Step 1 / Step 2)."
+                "This tab lists every vector store on your OpenAI account (including unrelated projects). "
+                "Step 6 / PARI gets its own per-session store (names usually start with quran-session-). "
+                "Bot 1 and Bot 2 never get auto-created stores: the two lower lists are only for optionally "
+                "attaching file_search to some stores you pick; leave them empty and those bots do not use "
+                "vector stores. The left list marks stores this app does not reference in its database or settings."
             ),
         ).pack(side="left", fill="x", expand=True)
 
@@ -176,15 +184,19 @@ class OpenAIAdminTab:
         )
         ttk.Button(bf_vsf, text="Remove from store", command=self._detach_vs_file).pack(side=LEFT)
 
-        lf_bot1 = ttk.LabelFrame(right, text="Bot 1 — file_search vector stores", padding=6)
+        lf_bot1 = ttk.LabelFrame(
+            right, text="Attach vector stores to Bot 1 (optional file_search)", padding=6
+        )
         lf_bot1.pack(fill=BOTH, expand=True)
         ttk.Label(
             lf_bot1,
             font=(latin_font, 9),
             wraplength=440,
             text=(
-                "Multi-select stores to search when running Bot 1 (optional). "
-                "Click Save to persist to disk (same settings file as the Bot 1 tab)."
+                "If you leave nothing highlighted, Bot 1 runs without searching any vector store. "
+                "If you do want RAG-style lookup, the list below is the same full catalog as on the left: "
+                "multi-select the stores to search, then Save. That list is global (all sessions), "
+                "separate from Step 6’s per-session store. Saved in data/chat/bot1_ui_settings.json."
             ),
         ).pack(anchor="w", pady=(0, 4))
         self._bot1_list = tk.Listbox(
@@ -208,15 +220,19 @@ class OpenAIAdminTab:
             skw["compound"] = "left"
         ttk.Button(bf_b, **skw).pack(side=LEFT)
 
-        lf_bot2 = ttk.LabelFrame(right, text="Bot 2 — file_search vector stores", padding=6)
+        lf_bot2 = ttk.LabelFrame(
+            right, text="Attach vector stores to Bot 2 (optional file_search)", padding=6
+        )
         lf_bot2.pack(fill=BOTH, expand=True)
         ttk.Label(
             lf_bot2,
             font=(latin_font, 9),
             wraplength=440,
             text=(
-                "Multi-select stores for Bot 2 (optional). "
-                "Persisted in data/chat/bot2_ui_settings.json."
+                "Same idea as Bot 1: empty selection means Bot 2 does not use file_search. "
+                "The list is the full account catalog for convenience; choose any subset for the synonyms step, "
+                "then Save. Global for all sessions; not the Step 6 session store. "
+                "Saved in data/chat/bot2_ui_settings.json."
             ),
         ).pack(anchor="w", pady=(0, 4))
         self._bot2_list = tk.Listbox(
@@ -256,7 +272,71 @@ class OpenAIAdminTab:
         self._root.clipboard_clear()
         self._root.clipboard_append(self._err_text.get("1.0", END).strip())
 
+    def _local_vector_store_refs(self) -> tuple[set[str], dict[str, list[str]]]:
+        """OpenAI vector store ids referenced by this app, plus human-readable usage lines."""
+        refs: set[str] = set()
+        lines: dict[str, list[str]] = {}
+
+        def tag(vsid: str, line: str) -> None:
+            vsid = str(vsid or "").strip()
+            if not vsid:
+                return
+            refs.add(vsid)
+            lines.setdefault(vsid, []).append(line)
+
+        try:
+            conn = connect()
+            try:
+                by_vs = map_openai_vector_store_id_to_chat_sessions(conn)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            by_vs = {}
+        for vsid, pairs in by_vs.items():
+            for _sid, title in pairs:
+                t = self._clip_title_for_list(title)
+                tag(vsid, f'Step 6 / PARI — session "{t}"')
+        for vsid in load_bot1_ui_settings().vector_store_ids:
+            tag(str(vsid), "Bot 1 file_search (shared, all sessions)")
+        for vsid in load_bot2_ui_settings().vector_store_ids:
+            tag(str(vsid), "Bot 2 file_search (shared, all sessions)")
+        for vsid in load_step6_ui_settings().extra_vector_store_ids:
+            tag(str(vsid), "Step 6 PARI extra file_search (shared)")
+        return refs, lines
+
+    @staticmethod
+    def _clip_title_for_list(title: str, max_len: int = 40) -> str:
+        t = (title or "").strip()
+        if len(t) <= max_len:
+            return t
+        return t[: max_len - 1] + "…"
+
+    def _format_vector_store_list_label(
+        self,
+        vs_id: str,
+        name: str | None,
+        *,
+        refs: set[str],
+        lines: dict[str, list[str]],
+    ) -> str:
+        vs_id = str(vs_id or "").strip()
+        nm = (name or "").strip() or "(no name)"
+        core = f"{nm}  [{vs_id}]"
+        if vs_id in refs:
+            extra = lines.get(vs_id, [])
+            if extra:
+                joined = "; ".join(extra)
+                if len(core) + len(joined) > 240:
+                    joined = joined[: 210] + "…"
+                return f"{core}  |  {joined}"
+            return core
+        low = nm.lower()
+        if low.startswith("quran-session-"):
+            return f"[orphan app-style name, not in local DB]  {core}"
+        return f"[not tracked by this app]  {core}"
+
     def _refresh_vector_stores(self) -> None:
+        refs, usage_lines = self._local_vector_store_refs()
         try:
             rows = list_vector_stores()
         except OpenAIAdminError as e:
@@ -268,13 +348,24 @@ class OpenAIAdminTab:
             sid = r["id"]
             self._vs_ids.append(sid)
             name = r.get("name") or ""
-            self._vs_list.insert(END, f"{name or '(no name)'}  [{sid}]")
-        self._sync_bot1_list(rows)
-        self._sync_bot2_list(rows)
+            self._vs_list.insert(
+                END,
+                self._format_vector_store_list_label(
+                    sid, name, refs=refs, lines=usage_lines
+                ),
+            )
+        self._sync_bot1_list(rows, refs=refs, lines=usage_lines)
+        self._sync_bot2_list(rows, refs=refs, lines=usage_lines)
         self._set_err(f"Loaded {len(rows)} vector store(s).")
         self._refresh_vs_files()
 
-    def _sync_bot1_list(self, rows: list[dict]) -> None:
+    def _sync_bot1_list(
+        self,
+        rows: list[dict],
+        *,
+        refs: set[str],
+        lines: dict[str, list[str]],
+    ) -> None:
         self._bot1_list.delete(0, END)
         self._bot1_ids = []
         saved = set(load_bot1_ui_settings().vector_store_ids)
@@ -283,13 +374,24 @@ class OpenAIAdminTab:
             sid = r["id"]
             self._bot1_ids.append(sid)
             name = r.get("name") or ""
-            self._bot1_list.insert(END, f"{name or '(no name)'}  [{sid}]")
+            self._bot1_list.insert(
+                END,
+                self._format_vector_store_list_label(
+                    sid, name, refs=refs, lines=lines
+                ),
+            )
             if sid in saved:
                 sel_idx.append(i)
         for j in sel_idx:
             self._bot1_list.selection_set(j)
 
-    def _sync_bot2_list(self, rows: list[dict]) -> None:
+    def _sync_bot2_list(
+        self,
+        rows: list[dict],
+        *,
+        refs: set[str],
+        lines: dict[str, list[str]],
+    ) -> None:
         self._bot2_list.delete(0, END)
         self._bot2_ids = []
         saved = set(load_bot2_ui_settings().vector_store_ids)
@@ -298,7 +400,12 @@ class OpenAIAdminTab:
             sid = r["id"]
             self._bot2_ids.append(sid)
             name = r.get("name") or ""
-            self._bot2_list.insert(END, f"{name or '(no name)'}  [{sid}]")
+            self._bot2_list.insert(
+                END,
+                self._format_vector_store_list_label(
+                    sid, name, refs=refs, lines=lines
+                ),
+            )
             if sid in saved:
                 sel_idx.append(i)
         for j in sel_idx:
@@ -320,6 +427,7 @@ class OpenAIAdminTab:
         vs = self._selected_vs_id()
         self._vsf_list.delete(0, END)
         self._vs_file_ids = []
+        self._vs_file_names = []
         if not vs:
             return
         try:
@@ -330,8 +438,13 @@ class OpenAIAdminTab:
         for r in rows:
             fid = r.get("id") or ""
             self._vs_file_ids.append(fid)
+            fn = (r.get("filename") or "").strip()
+            self._vs_file_names.append(fn or None)
             st = r.get("status") or ""
-            self._vsf_list.insert(END, f"{fid}  ({st})")
+            if fn:
+                self._vsf_list.insert(END, f"{fn}  [{fid}]  ({st})")
+            else:
+                self._vsf_list.insert(END, f"(no filename)  [{fid}]  ({st})")
         self._set_err(f"Vector store {vs}: {len(rows)} file(s).")
 
     def _refresh_files(self) -> None:
@@ -364,23 +477,193 @@ class OpenAIAdminTab:
             return
         self._refresh_vector_stores()
 
+    def _prompt_vector_store_delete_mode(
+        self, *, vs_id: str, vs_name: str, n_files: int
+    ) -> str | None:
+        """
+        Return ``'store_only'``, ``'store_and_files'``, or ``None`` if cancelled.
+        """
+        result: list[str | None] = [None]
+        dlg = tk.Toplevel(self._root)
+        dlg.title("Delete vector store")
+        dlg.transient(self._root)
+        dlg.grab_set()
+        dlg.resizable(True, False)
+        pad = {"padx": 12, "pady": 6}
+        nm = vs_name.strip() or "(no name)"
+        ttk.Label(
+            dlg,
+            text=f"Vector store name:\n{nm}\n\nID:\n{vs_id}",
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", **pad)
+        choice = tk.IntVar(value=0)
+        rb0 = ttk.Radiobutton(
+            dlg,
+            text=(
+                "Delete the vector store only. "
+                "OpenAI File objects that were attached stay in your account "
+                "(you can delete them separately under Files (platform))."
+            ),
+            variable=choice,
+            value=0,
+        )
+        rb0.pack(anchor="w", padx=12, pady=(8, 4))
+        rb1_text = (
+            f"Also delete each OpenAI File object listed in this store, one by one "
+            f"({n_files} file(s); cannot be undone), then remove the vector store."
+            if n_files
+            else "Also delete OpenAI File objects in this store (no files attached — same as above)."
+        )
+        rb1 = ttk.Radiobutton(
+            dlg,
+            text=rb1_text,
+            variable=choice,
+            value=1,
+        )
+        rb1.pack(anchor="w", padx=12, pady=(4, 8))
+        if n_files == 0:
+            rb1.state(["disabled"])
+
+        def on_ok() -> None:
+            if n_files == 0:
+                result[0] = "store_only"
+            else:
+                result[0] = "store_and_files" if int(choice.get()) == 1 else "store_only"
+            dlg.destroy()
+
+        def on_cancel() -> None:
+            result[0] = None
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(bf, text="Continue", command=on_ok).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(bf, text="Cancel", command=on_cancel).pack(side=LEFT)
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.update_idletasks()
+        w = max(dlg.winfo_reqwidth(), 540)
+        dlg.geometry(f"{int(w)}x{dlg.winfo_reqheight()}")
+        self._root.wait_window(dlg)
+        return result[0]
+
+    def _delete_vector_store_files_with_progress(
+        self, vs_id: str, file_rows: list[dict]
+    ) -> list[str]:
+        """
+        Detach each file from the vector store, delete the File object on OpenAI,
+        then delete the vector store. Runs on the UI thread with a progress window.
+        Returns a list of human-readable error lines (empty on full success).
+        """
+        errors: list[str] = []
+        n = len(file_rows)
+        top = tk.Toplevel(self._root)
+        top.title("Deleting vector store files")
+        top.transient(self._root)
+        top.grab_set()
+        fr = ttk.Frame(top, padding=12)
+        fr.pack(fill=BOTH, expand=True)
+        status = tk.StringVar(value="Preparing…")
+        ttk.Label(fr, textvariable=status, wraplength=520, justify="left").pack(
+            anchor="w", pady=(0, 8)
+        )
+        pb = ttk.Progressbar(
+            fr, mode="determinate", maximum=max(1, n), length=480
+        )
+        pb.pack(fill="x", pady=(0, 8))
+        top.update_idletasks()
+        top.geometry(f"{max(560, top.winfo_reqwidth())}x{top.winfo_reqheight() + 8}")
+
+        for i, row in enumerate(file_rows):
+            fid = str(row.get("id") or "").strip()
+            if not fid:
+                continue
+            fn = (row.get("filename") or "").strip() or fid
+            status.set(f"File {i + 1} of {n}: {fn}")
+            pb["value"] = float(i)
+            top.update_idletasks()
+            top.update()
+            try:
+                delete_vector_store_file(vs_id, fid)
+            except OpenAIAdminError as e:
+                errors.append(f"Detach {fid} from vector store: {e}")
+            try:
+                delete_file(fid)
+            except OpenAIAdminError as e:
+                errors.append(f"Delete OpenAI file {fid}: {e}")
+            pb["value"] = float(i + 1)
+            top.update_idletasks()
+            top.update()
+
+        status.set("Removing vector store…")
+        pb["value"] = float(max(1, n))
+        top.update_idletasks()
+        top.update()
+        try:
+            delete_vector_store(vs_id)
+        except OpenAIAdminError as e:
+            errors.append(f"Delete vector store {vs_id}: {e}")
+        top.grab_release()
+        top.destroy()
+        return errors
+
     def _delete_vector_store(self) -> None:
         vs = self._selected_vs_id()
         if not vs:
             messagebox.showinfo("Vector store", "Select a vector store first.", parent=self._root)
             return
-        if not messagebox.askyesno(
-            "Delete vector store",
-            f"Delete vector store {vs}?",
-            parent=self._root,
-        ):
-            return
+        vs_name = ""
         try:
-            delete_vector_store(vs)
+            for r in list_vector_stores():
+                if r["id"] == vs:
+                    vs_name = (r.get("name") or "").strip()
+                    break
         except OpenAIAdminError as e:
             self._set_err(str(e))
             return
+        try:
+            file_rows = list_vector_store_files(vs)
+        except OpenAIAdminError as e:
+            self._set_err(str(e))
+            return
+        mode = self._prompt_vector_store_delete_mode(
+            vs_id=vs, vs_name=vs_name, n_files=len(file_rows)
+        )
+        if mode is None:
+            return
+        if mode == "store_only":
+            try:
+                delete_vector_store(vs)
+            except OpenAIAdminError as e:
+                self._set_err(str(e))
+                return
+            self._refresh_vector_stores()
+            self._refresh_vs_files()
+            self._set_err(f"Deleted vector store {vs} (files were not removed from OpenAI).")
+            return
+        if not file_rows:
+            try:
+                delete_vector_store(vs)
+            except OpenAIAdminError as e:
+                self._set_err(str(e))
+                return
+            self._refresh_vector_stores()
+            self._refresh_vs_files()
+            self._refresh_files()
+            self._set_err(f"Deleted vector store {vs} (no files were attached).")
+            return
+        err_lines = self._delete_vector_store_files_with_progress(vs, file_rows)
         self._refresh_vector_stores()
+        self._refresh_files()
+        self._refresh_vs_files()
+        msg = (
+            f"Deleted vector store {vs} and removed {len(file_rows)} file object(s) from OpenAI."
+        )
+        if err_lines:
+            msg += "\n\nSome steps reported errors:\n" + "\n".join(err_lines[:20])
+            if len(err_lines) > 20:
+                msg += f"\n… and {len(err_lines) - 20} more."
+        self._set_err(msg)
 
     def _upload_file(self) -> None:
         path = filedialog.askopenfilename(parent=self._root, title="Upload file to OpenAI")
@@ -446,9 +729,15 @@ class OpenAIAdminTab:
         if i < 0 or i >= len(self._vs_file_ids):
             return
         fid = self._vs_file_ids[i]
+        fn = (
+            self._vs_file_names[i]
+            if i < len(self._vs_file_names)
+            else None
+        )
+        label = f"{fn} ({fid})" if fn else fid
         if not messagebox.askyesno(
             "Remove file",
-            f"Remove file {fid} from vector store {vs}?",
+            f"Remove {label} from vector store {vs}?",
             parent=self._root,
         ):
             return

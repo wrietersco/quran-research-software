@@ -16,7 +16,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 import tkinter as tk
-from tkinter import BOTH, END, HORIZONTAL, LEFT, RIGHT, VERTICAL, messagebox, simpledialog, ttk
+from tkinter import BOTH, END, HORIZONTAL, LEFT, RIGHT, VERTICAL, filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from src.chat.bot1_engine import (
@@ -95,7 +95,17 @@ from src.chat.session_cleanup import (
     SESSION_DELETE_STEP_LABELS,
     run_session_deletion_desktop,
 )
+from src.chat.session_document_policy import (
+    MAX_ATTACHED_FILES_PER_SESSION,
+    MAX_UPLOAD_FILE_BYTES,
+)
+from src.chat.session_document_upload import (
+    SessionDocumentUploadError,
+    remove_session_user_document,
+    upload_session_user_document,
+)
 from src.chat.session_vector_store import create_session_vector_store_async
+from src.chat.step6_ui_settings import merged_file_search_vector_ids
 from src.ui.session_delete_progress import SessionDeleteProgressDialog
 from src.chat.sessions_store import ChatSessionsStore
 from src.config import (  # loads `.env` on first import (see config._load_dotenv)
@@ -135,7 +145,10 @@ from src.db.find_verses import (
     search_arabic_text_in_quran,
 )
 from src.db.chat_pipeline import (
+    STEP_BOT1_TOPICS_CONNOTATIONS,
+    STEP_BOT2_ARABIC_SYNONYMS,
     fetch_latest_bot1_analysis_dict,
+    get_chat_session_openai_vector_store_id,
     insert_bot1_step_run,
     refined_question_id_for_session,
     refined_question_text_for_session,
@@ -143,6 +156,7 @@ from src.db.chat_pipeline import (
     upsert_chat_session,
     upsert_session_refined_question,
 )
+from src.db.session_attached_documents import list_session_attached_documents
 from src.db.connection import connect
 from src.ui.step6_report_tab import Step6ReportPane
 from src.db.find_match_words import fetch_token_ids_for_find_match
@@ -223,6 +237,321 @@ def _session_delete_confirmation_text(session_id: str) -> str:
     )
 
 
+def _hydrate_pipeline_metrics_from_db(sid: str) -> dict[int, StepPipelineMetric]:
+    """
+    Rebuild Summary-tab metrics from SQLite (tokens, costs, rough timings).
+
+    In-session ``_pipeline_metrics`` is populated as steps finish; this fills gaps after
+    restart or when switching sessions so completed work still appears in Summary.
+    """
+    out: dict[int, StepPipelineMetric] = {}
+    try:
+        conn = connect(get_db_path())
+    except (OSError, sqlite3.Error):
+        return out
+    try:
+        def _dur_sec(t0: str | None, t1: str | None) -> float:
+            if not t0 or not t1:
+                return 0.0
+            try:
+                a = datetime.strptime(str(t0)[:19], "%Y-%m-%d %H:%M:%S")
+                b = datetime.strptime(str(t1)[:19], "%Y-%m-%d %H:%M:%S")
+                return max(0.0, (b - a).total_seconds())
+            except ValueError:
+                return 0.0
+
+        row = conn.execute(
+            """
+            SELECT model, prompt_tokens, completion_tokens, created_at
+            FROM pipeline_step_runs
+            WHERE chat_session_id = ? AND step_key = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (sid, STEP_BOT1_TOPICS_CONNOTATIONS),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                """
+                SELECT model, prompt_tokens, completion_tokens, created_at
+                FROM bot1_analysis_runs
+                WHERE chat_session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (sid,),
+            ).fetchone()
+        if row is not None:
+            mname = str(row["model"] or "").strip() or "(unknown)"
+            pt = int(row["prompt_tokens"] or 0)
+            ct = int(row["completion_tokens"] or 0)
+            cin, cout, _ = split_cost_usd("openai", mname, prompt_tokens=pt, completion_tokens=ct)
+            ca = str(row["created_at"] or "")[:19]
+            out[1] = StepPipelineMetric(
+                agent_involved=True,
+                input_tokens=pt,
+                output_tokens=ct,
+                input_cost_usd=cin,
+                output_cost_usd=cout,
+                models_label=mname,
+                duration_secs=0.0,
+                started_at_iso=ca,
+                ended_at_iso=ca,
+            )
+
+        rows_b2 = conn.execute(
+            """
+            SELECT model, prompt_tokens, completion_tokens, created_at
+            FROM pipeline_step_runs
+            WHERE chat_session_id = ? AND step_key = ?
+            ORDER BY id ASC
+            """,
+            (sid, STEP_BOT2_ARABIC_SYNONYMS),
+        ).fetchall()
+        if rows_b2:
+            pt = ct = 0
+            cin = cout = 0.0
+            models_order: list[str] = []
+            t_first: str | None = None
+            t_last: str | None = None
+            for r in rows_b2:
+                pti = int(r["prompt_tokens"] or 0)
+                cti = int(r["completion_tokens"] or 0)
+                pt += pti
+                ct += cti
+                mn = str(r["model"] or "").strip()
+                a, b, _ = split_cost_usd("openai", mn, prompt_tokens=pti, completion_tokens=cti)
+                cin += a
+                cout += b
+                if mn and mn not in models_order:
+                    models_order.append(mn)
+                ts = str(r["created_at"] or "")
+                if ts:
+                    t_first = ts if t_first is None else min(t_first, ts)
+                    t_last = ts if t_last is None else max(t_last, ts)
+            t0s = (t_first or "")[:19]
+            t1s = (t_last or t_first or "")[:19]
+            out[2] = StepPipelineMetric(
+                agent_involved=True,
+                input_tokens=pt,
+                output_tokens=ct,
+                input_cost_usd=cin,
+                output_cost_usd=cout,
+                models_label=", ".join(models_order) if models_order else "(unknown)",
+                duration_secs=_dur_sec(t0s, t1s),
+                started_at_iso=t0s or "—",
+                ended_at_iso=t1s or t0s or "—",
+            )
+
+        r3 = conn.execute(
+            """
+            SELECT COUNT(*) AS c,
+                   MIN(created_at) AS t0,
+                   MAX(created_at) AS t1
+            FROM find_verse_matches
+            WHERE chat_session_id = ?
+            """,
+            (sid,),
+        ).fetchone()
+        if r3 is not None and int(r3["c"] or 0) > 0:
+            n = int(r3["c"])
+            t0s = str(r3["t0"] or "")[:19]
+            t1s = str(r3["t1"] or "")[:19]
+            out[3] = StepPipelineMetric(
+                agent_involved=False,
+                input_tokens=0,
+                output_tokens=0,
+                input_cost_usd=0.0,
+                output_cost_usd=0.0,
+                models_label=f"Local scan — {n} saved match row(s)",
+                duration_secs=_dur_sec(t0s, t1s),
+                started_at_iso=t0s or "—",
+                ended_at_iso=t1s or t0s or "—",
+            )
+
+        try:
+            s4_rows = fetch_step4_kalimat_pipeline_rows(conn, sid)
+        except (OSError, sqlite3.Error):
+            s4_rows = []
+        if s4_rows:
+            t_anchor = ""
+            if 3 in out:
+                t_anchor = out[3].ended_at_iso
+            if not t_anchor or t_anchor == "—":
+                r3b = conn.execute(
+                    """
+                    SELECT MAX(created_at) AS t1
+                    FROM find_verse_matches
+                    WHERE chat_session_id = ?
+                    """,
+                    (sid,),
+                ).fetchone()
+                t_anchor = str(r3b["t1"] or "")[:19] if r3b else ""
+            out[4] = StepPipelineMetric(
+                agent_involved=False,
+                input_tokens=0,
+                output_tokens=0,
+                input_cost_usd=0.0,
+                output_cost_usd=0.0,
+                models_label=f"DB kalimat view ({len(s4_rows)} pipeline row(s))",
+                duration_secs=0.0,
+                started_at_iso=t_anchor or "—",
+                ended_at_iso=t_anchor or "—",
+            )
+
+        run5 = latest_step5_run_id_for_session(conn, sid)
+        if run5 is not None and step5_run_is_resumable(conn, run5):
+            run5 = None
+        if run5 is not None:
+            canc = conn.execute(
+                "SELECT cancelled_at FROM step5_synthesis_runs WHERE id = ?",
+                (run5,),
+            ).fetchone()
+            if not (canc and canc["cancelled_at"]):
+                try:
+                    analytics = fetch_step5_run_analytics(conn, run5)
+                    cin, cout, ml = fetch_step5_run_models_and_split_cost(conn, run5)
+                    tot_split = cin + cout
+                    if tot_split > 1e-12 and analytics.total_cost_usd >= 0:
+                        sc = analytics.total_cost_usd / tot_split
+                        cin *= sc
+                        cout *= sc
+                    r5t = conn.execute(
+                        """
+                        SELECT created_at FROM step5_synthesis_runs WHERE id = ?
+                        """,
+                        (run5,),
+                    ).fetchone()
+                    t0s = str(r5t["created_at"] or "")[:19] if r5t else ""
+                    r5end = conn.execute(
+                        """
+                        SELECT MAX(created_at) AS t1
+                        FROM step5_synthesis_results
+                        WHERE run_id = ?
+                        """,
+                        (run5,),
+                    ).fetchone()
+                    t1s = str(r5end["t1"] or "")[:19] if r5end and r5end["t1"] else t0s
+                    out[5] = StepPipelineMetric(
+                        agent_involved=True,
+                        input_tokens=int(analytics.sum_prompt_tokens),
+                        output_tokens=int(analytics.sum_completion_tokens),
+                        input_cost_usd=float(cin),
+                        output_cost_usd=float(cout),
+                        models_label=ml,
+                        duration_secs=_dur_sec(t0s, t1s),
+                        started_at_iso=t0s or "—",
+                        ended_at_iso=t1s or t0s or "—",
+                    )
+                except (OSError, sqlite3.Error, TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+        row_done = conn.execute(
+            """
+            SELECT id, model, created_at, updated_at
+            FROM step6_report_runs
+            WHERE chat_session_id = ? AND status = 'done'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (sid,),
+        ).fetchone()
+        arows = conn.execute(
+            """
+            SELECT id, meta_json, created_at
+            FROM step6_report_chat_messages
+            WHERE chat_session_id = ? AND role = 'assistant'
+              AND meta_json IS NOT NULL AND TRIM(meta_json) != ''
+            ORDER BY id DESC
+            LIMIT 40
+            """,
+            (sid,),
+        ).fetchall()
+        discuss_pick = None
+        for ar in arows:
+            try:
+                meta = json.loads(str(ar["meta_json"]))
+            except json.JSONDecodeError:
+                continue
+            pt = int(meta.get("prompt_tokens") or 0)
+            ct = int(meta.get("completion_tokens") or 0)
+            if pt or ct:
+                discuss_pick = (ar, meta)
+                break
+        kf = conn.execute(
+            """
+            SELECT COUNT(*) AS c, MIN(created_at) AS t0, MAX(created_at) AS t1
+            FROM step6_knowledge_files
+            WHERE chat_session_id = ?
+            """,
+            (sid,),
+        ).fetchone()
+        kf_n = int(kf["c"] or 0) if kf else 0
+        cands: list[tuple[str, str, object]] = []
+        pri = {"discuss": 2, "pari": 1, "load": 0}
+        if row_done is not None:
+            ts = str(row_done["updated_at"] or row_done["created_at"] or "")
+            cands.append(("pari", ts, row_done))
+        if discuss_pick is not None:
+            ts = str(discuss_pick[0]["created_at"] or "")
+            cands.append(("discuss", ts, discuss_pick))
+        if kf_n > 0 and kf is not None:
+            ts = str(kf["t1"] or kf["t0"] or "")
+            cands.append(("load", ts, kf))
+        if cands:
+            kind, _, payload = max(cands, key=lambda it: (str(it[1]), pri[it[0]]))
+            if kind == "discuss" and isinstance(payload, tuple):
+                ar, meta = payload
+                mname = str(meta.get("model") or "").strip() or "gpt-4o-mini"
+                pt = int(meta.get("prompt_tokens") or 0)
+                ct = int(meta.get("completion_tokens") or 0)
+                cin, cout, _ = split_cost_usd("openai", mname, prompt_tokens=pt, completion_tokens=ct)
+                ca = str(ar["created_at"] or "")[:19]
+                out[6] = StepPipelineMetric(
+                    agent_involved=True,
+                    input_tokens=pt,
+                    output_tokens=ct,
+                    input_cost_usd=cin,
+                    output_cost_usd=cout,
+                    models_label=f"Discuss — {mname}",
+                    duration_secs=0.0,
+                    started_at_iso=ca,
+                    ended_at_iso=ca,
+                )
+            elif kind == "pari" and isinstance(payload, sqlite3.Row):
+                mname = str(payload["model"] or "").strip() or "gpt-4o-mini"
+                t0s = str(payload["created_at"] or "")[:19]
+                t1s = str(payload["updated_at"] or "")[:19]
+                out[6] = StepPipelineMetric(
+                    agent_involved=True,
+                    input_tokens=0,
+                    output_tokens=0,
+                    input_cost_usd=0.0,
+                    output_cost_usd=0.0,
+                    models_label=f"PARI report — {mname} (tokens not stored)",
+                    duration_secs=_dur_sec(t0s, t1s),
+                    started_at_iso=t0s or "—",
+                    ended_at_iso=t1s or t0s or "—",
+                )
+            elif kind == "load":
+                t0s = str(kf["t0"] or "")[:19] if kf else ""
+                t1s = str(kf["t1"] or "")[:19] if kf else ""
+                out[6] = StepPipelineMetric(
+                    agent_involved=False,
+                    input_tokens=0,
+                    output_tokens=0,
+                    input_cost_usd=0.0,
+                    output_cost_usd=0.0,
+                    models_label=f"Load → vector store ({kf_n} chunk(s))",
+                    duration_secs=_dur_sec(t0s, t1s),
+                    started_at_iso=t0s or "—",
+                    ended_at_iso=t1s or t0s or "—",
+                )
+    finally:
+        conn.close()
+    return out
+
+
 class QuestionRefinerTab:
     def __init__(
         self,
@@ -269,6 +598,7 @@ class QuestionRefinerTab:
         self._fv_pipeline_row_cache: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
         self._step5_orchestrator: Step5Orchestrator | None = None
         self._step5_poll_after_id: str | None = None
+        self._attachment_doc_ids: list[int] = []
         self._step5_live_refresh_after_id: str | None = None
         self._bot2_refresh_after_id: str | None = None
         self._step5_run_id_by_session: dict[str, int] = {}
@@ -483,6 +813,52 @@ class QuestionRefinerTab:
         _log_row = _intro_rows
         log_fr = ttk.Frame(center, style="Card.TFrame")
         log_fr.grid(row=_log_row, column=0, sticky="new", pady=(0, 10))
+        att_fr = ttk.Frame(log_fr, style="Card.TFrame")
+        att_fr.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(att_fr, text="Session documents", style="ChatSection.TLabel").pack(
+            anchor="w", pady=(0, 4)
+        )
+        att_btn_row = ttk.Frame(att_fr, style="Card.TFrame")
+        att_btn_row.pack(fill=tk.X)
+        self._refine_attach_btn = ttk.Button(
+            att_btn_row,
+            text="Attach document…",
+            command=self._on_refine_attach_document,
+        )
+        self._refine_attach_btn.pack(side=LEFT)
+        self._refine_remove_attach_btn = ttk.Button(
+            att_btn_row,
+            text="Remove selected",
+            command=self._on_refine_remove_attachment,
+        )
+        self._refine_remove_attach_btn.pack(side=LEFT, padx=(8, 0))
+        att_list_fr = ttk.Frame(att_fr, style="Card.TFrame")
+        att_list_fr.pack(fill=tk.X, pady=(4, 0))
+        self._refine_attachment_list = tk.Listbox(
+            att_list_fr,
+            height=4,
+            activestyle="dotbox",
+            selectmode=tk.EXTENDED,
+        )
+        style_tk_listbox(self._refine_attachment_list, latin_family=latin_font, size=9)
+        att_sb = ttk.Scrollbar(
+            att_list_fr, orient=VERTICAL, command=self._refine_attachment_list.yview
+        )
+        self._refine_attachment_list.configure(yscrollcommand=att_sb.set)
+        self._refine_attachment_list.pack(side=LEFT, fill=tk.X, expand=True)
+        att_sb.pack(side=RIGHT, fill="y")
+        max_mb = MAX_UPLOAD_FILE_BYTES // (1024 * 1024)
+        ttk.Label(
+            att_fr,
+            style="Hint.TLabel",
+            wraplength=640,
+            justify="left",
+            text=(
+                f"Indexed on OpenAI for this session’s vector store (Refine file_search, Bot 1, Bot 2, Step 6). "
+                f"Up to {MAX_ATTACHED_FILES_PER_SESSION} files; max {max_mb} MiB each. "
+                "Types include .pdf, .txt, .md, .docx, .json, .csv, and common source formats."
+            ),
+        ).pack(anchor="w", pady=(4, 0))
         ttk.Label(log_fr, text="Messages", style="ChatSection.TLabel").pack(
             anchor="w", pady=(0, 8)
         )
@@ -603,7 +979,8 @@ class QuestionRefinerTab:
             justify="left",
             style="Hint.TLabel",
             text=(
-                "Sent as the Chat Completions system message. Save edits to "
+                "Sent as the system message (Chat Completions when there is no session vector store; "
+                "otherwise the Responses API with file_search over that store). Save edits to "
                 "data/chat/refiner_system_base.txt. Send uses the text below; do not leave it empty after Reload."
             ),
         ).pack(anchor="w", pady=(0, 8))
@@ -4719,8 +5096,15 @@ class QuestionRefinerTab:
         if not hasattr(self, "_summary_pane"):
             return
         sid = self._current_id
-        by = self._pipeline_metrics.get(sid) if sid else None
-        self._summary_pane.refresh_from_store(by)
+        mem = self._pipeline_metrics.get(sid) if sid else None
+        if not sid:
+            self._summary_pane.refresh_from_store(mem)
+            return
+        dbm = _hydrate_pipeline_metrics_from_db(sid)
+        merged: dict[int, StepPipelineMetric] = dict(dbm)
+        if mem:
+            merged.update(mem)
+        self._summary_pane.refresh_from_store(merged if merged else None)
 
     def _pipeline_step_start(self, sid: str, step: int) -> None:
         self._pipeline_step_clock[(sid, step)] = (time.monotonic(), datetime.now())
@@ -5411,6 +5795,12 @@ class QuestionRefinerTab:
             self._step6_load_btn.configure(state="disabled")
         if hasattr(self, "_step6_write_btn"):
             self._step6_write_btn.configure(state="disabled")
+        if hasattr(self, "_refine_attach_btn"):
+            self._refine_attach_btn.configure(state="disabled")
+        if hasattr(self, "_refine_remove_attach_btn"):
+            self._refine_remove_attach_btn.configure(state="disabled")
+        if hasattr(self, "_refine_attachment_list"):
+            self._refine_attachment_list.configure(state="disabled")
         self._sync_stop_buttons()
 
     def _end_busy(self, status_msg: str | None = None) -> None:
@@ -5452,6 +5842,12 @@ class QuestionRefinerTab:
             self._step6_load_btn.configure(state="normal")
         if hasattr(self, "_step6_write_btn"):
             self._step6_write_btn.configure(state="normal")
+        if hasattr(self, "_refine_attach_btn"):
+            self._refine_attach_btn.configure(state="normal")
+        if hasattr(self, "_refine_remove_attach_btn"):
+            self._refine_remove_attach_btn.configure(state="normal")
+        if hasattr(self, "_refine_attachment_list"):
+            self._refine_attachment_list.configure(state="normal")
         self._sync_stop_buttons()
 
     def _sync_stop_buttons(self) -> None:
@@ -5791,6 +6187,7 @@ class QuestionRefinerTab:
         self._log.delete("1.0", END)
         if not s:
             self._log.configure(state="disabled")
+            self._refresh_refine_attachment_list()
             return
         for m in s.messages:
             if m.role == "user":
@@ -5800,6 +6197,127 @@ class QuestionRefinerTab:
                 self._append_assistant_message(m.content)
         self._log.configure(state="disabled")
         self._log.see(END)
+        self._refresh_refine_attachment_list()
+
+    def _refresh_refine_attachment_list(self) -> None:
+        if not hasattr(self, "_refine_attachment_list"):
+            return
+        self._refine_attachment_list.delete(0, END)
+        self._attachment_doc_ids.clear()
+        sid = self._current_id
+        if not sid:
+            return
+        try:
+            conn = connect(get_db_path())
+            try:
+                rows = list_session_attached_documents(conn, sid)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            return
+        for r in rows:
+            self._attachment_doc_ids.append(r.id)
+            sz = r.size_bytes
+            if sz >= 1024 * 1024:
+                sz_label = f"{sz / (1024 * 1024):.1f} MiB"
+            elif sz >= 1024:
+                sz_label = f"{sz // 1024} KiB"
+            else:
+                sz_label = f"{sz} B"
+            self._refine_attachment_list.insert(END, f"{r.original_filename} ({sz_label})")
+
+    def _on_refine_attach_document(self) -> None:
+        if self._busy:
+            return
+        if not self._current_id:
+            self._new_session()
+        sid = self._current_id
+        if not sid:
+            return
+        path = filedialog.askopenfilename(parent=self._root, title="Attach document")
+        if not path:
+            return
+        src = Path(path)
+        sess = self._store.get(sid)
+        title = sess.title if sess else None
+
+        self._begin_busy("Uploading document…", op="attach")
+
+        def work() -> None:
+            err: str | None = None
+            try:
+                conn = connect(get_db_path())
+                try:
+                    upload_session_user_document(conn, sid, title, src)
+                finally:
+                    conn.close()
+            except SessionDocumentUploadError as e:
+                err = str(e)
+            except Exception as e:
+                err = str(e)
+
+            def done() -> None:
+                self._end_busy("Ready." if not err else "Attach failed.")
+                self._refresh_refine_attachment_list()
+                if err:
+                    messagebox.showerror("Attach document", err, parent=self._root)
+                else:
+                    if hasattr(self, "_step6_pane"):
+                        self._step6_pane.refresh_vector_status()
+
+            self._root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_refine_remove_attachment(self) -> None:
+        if self._busy:
+            return
+        sid = self._current_id
+        if not sid or not hasattr(self, "_refine_attachment_list"):
+            return
+        sel = self._refine_attachment_list.curselection()
+        if not sel:
+            messagebox.showinfo(
+                "Remove document",
+                "Select one or more documents in the list first.",
+                parent=self._root,
+            )
+            return
+        doc_ids = [self._attachment_doc_ids[i] for i in sel if 0 <= i < len(self._attachment_doc_ids)]
+        if not doc_ids:
+            return
+        if not messagebox.askyesno(
+            "Remove document",
+            f"Remove {len(doc_ids)} file(s) from this session’s vector store and disk?",
+            parent=self._root,
+        ):
+            return
+
+        self._begin_busy("Removing document(s)…", op="attach")
+
+        def work() -> None:
+            err: str | None = None
+            try:
+                conn = connect(get_db_path())
+                try:
+                    for did in doc_ids:
+                        remove_session_user_document(conn, sid, did)
+                finally:
+                    conn.close()
+            except Exception as e:
+                err = str(e)
+
+            def done() -> None:
+                self._end_busy("Ready." if not err else "Remove failed.")
+                self._refresh_refine_attachment_list()
+                if err:
+                    messagebox.showerror("Remove document", err, parent=self._root)
+                elif hasattr(self, "_step6_pane"):
+                    self._step6_pane.refresh_vector_status()
+
+            self._root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _append_log(self, role: str, text: str) -> None:
         self._log.configure(state="normal")
@@ -5950,8 +6468,23 @@ class QuestionRefinerTab:
         self._begin_busy("Waiting for model…", op="refine")
 
         def work() -> None:
+            vs_for_refine: list[str] | None = None
             try:
-                result = refine_reply(api_messages, instructions_base=ref_instructions)
+                c = connect(get_db_path())
+                try:
+                    vid = get_chat_session_openai_vector_store_id(c, sid)
+                    if vid and str(vid).strip():
+                        vs_for_refine = merged_file_search_vector_ids(str(vid).strip(), [])
+                finally:
+                    c.close()
+            except (OSError, sqlite3.Error):
+                vs_for_refine = None
+            try:
+                result = refine_reply(
+                    api_messages,
+                    instructions_base=ref_instructions,
+                    vector_store_ids=vs_for_refine,
+                )
             except RefineError as e:
                 err = str(e)
                 self._root.after(0, lambda: self._on_refine_error(sid, err))
@@ -6007,7 +6540,6 @@ class QuestionRefinerTab:
         ui.model = self._bot1_model_var.get().strip()
         save_bot1_ui_settings(ui)
         model = ui.model
-        vs_ids = ui.vector_store_ids if ui.vector_store_ids else None
         core_instructions: str | None
         if hasattr(self, "_bot1_sys_core"):
             core_instructions = self._bot1_sys_core.get("1.0", END).rstrip()
@@ -6020,10 +6552,23 @@ class QuestionRefinerTab:
         def work() -> None:
             cancel = self._cancel_bot_work
             try:
+                try:
+                    c = connect(get_db_path())
+                    try:
+                        session_vid = get_chat_session_openai_vector_store_id(c, sid)
+                        vs_ids = merged_file_search_vector_ids(
+                            (session_vid or "").strip(),
+                            list(ui.vector_store_ids or []),
+                        )
+                    finally:
+                        c.close()
+                except (OSError, sqlite3.Error):
+                    vs_ids = list(ui.vector_store_ids or [])
+                vs_arg = vs_ids if vs_ids else None
                 br = run_bot1(
                     refined,
                     model=model,
-                    vector_store_ids=vs_ids,
+                    vector_store_ids=vs_arg,
                     temperature=ui.temperature,
                     cancel_event=cancel,
                     instructions_base=core_instructions,
@@ -6180,7 +6725,6 @@ class QuestionRefinerTab:
             return
 
         model = ui.model
-        vs_ids = ui.vector_store_ids if ui.vector_store_ids else None
         max_syn = max(1, min(30, int(ui.max_synonyms)))
         temp = ui.temperature
         core2: str | None
@@ -6194,6 +6738,19 @@ class QuestionRefinerTab:
 
         def work() -> None:
             cancel = self._cancel_bot_work
+            try:
+                c2 = connect(get_db_path())
+                try:
+                    session_vid2 = get_chat_session_openai_vector_store_id(c2, sid)
+                    vs_ids2 = merged_file_search_vector_ids(
+                        (session_vid2 or "").strip(),
+                        list(ui.vector_store_ids or []),
+                    )
+                finally:
+                    c2.close()
+            except (OSError, sqlite3.Error):
+                vs_ids2 = list(ui.vector_store_ids or [])
+            vs_arg2 = vs_ids2 if vs_ids2 else None
             ok: list[tuple[ConnotationWorkItem, Bot2Result]] = []
             err_lines: list[str] = []
             n = len(items)
@@ -6214,7 +6771,7 @@ class QuestionRefinerTab:
                         topic_text=item.topic_text,
                         refined_question=rq_text,
                         model=model,
-                        vector_store_ids=vs_ids,
+                        vector_store_ids=vs_arg2,
                         max_synonyms=max_syn,
                         temperature=temp,
                         cancel_event=cancel,

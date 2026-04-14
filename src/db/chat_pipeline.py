@@ -59,6 +59,32 @@ def get_chat_session_openai_vector_store_id(
     return str(v).strip() if v else None
 
 
+def map_openai_vector_store_id_to_chat_sessions(
+    conn: sqlite3.Connection,
+) -> dict[str, list[tuple[str, str]]]:
+    """
+    Map each OpenAI vector store id to chat sessions that use it as the Step 6
+    (PARI / session knowledge) store. Values are (chat_session_id, title) pairs.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, title, openai_vector_store_id
+        FROM chat_sessions
+        WHERE openai_vector_store_id IS NOT NULL
+          AND trim(openai_vector_store_id) != ''
+        """
+    ).fetchall()
+    out: dict[str, list[tuple[str, str]]] = {}
+    for r in rows:
+        vsid = str(r["openai_vector_store_id"] or "").strip()
+        if not vsid:
+            continue
+        sid = str(r["id"])
+        title = (r["title"] or "").strip() or sid[:10]
+        out.setdefault(vsid, []).append((sid, title))
+    return out
+
+
 def set_chat_session_openai_vector_store_id(
     conn: sqlite3.Connection,
     chat_session_id: str,
